@@ -4,6 +4,8 @@ A terminal tool that monitors your Claude Code usage — from a cute animated wi
 
 ![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue)
 
+![clu dashboard](screenshot.png)
+
 ## What it does
 
 **Widget mode** (default) — the original cute clu:
