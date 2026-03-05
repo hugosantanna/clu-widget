@@ -1,4 +1,4 @@
-# clu - Claude Usage Monitor 2.0
+# clu - Claude Usage Monitor
 
 A terminal tool that monitors your Claude Code usage — from a cute animated widget to a full per-project dashboard.
 
