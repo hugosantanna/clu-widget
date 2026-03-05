@@ -1331,6 +1331,12 @@ def main():
         ))
         sys.exit(1)
 
+    try:
+        _run_loop(args, token, api_data, last_ok, error_msg, tick, data_dirs, data_dirs_info)
+    except KeyboardInterrupt:
+        _cleanup()
+
+def _run_loop(args, token, api_data, last_ok, error_msg, tick, data_dirs, data_dirs_info):
     if args.dash:
         _setup_terminal(dash=True)
         console = Console(highlight=False)
@@ -1427,8 +1433,4 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        _cleanup()
-        print()  # clean exit
+    main()

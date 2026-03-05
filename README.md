@@ -104,6 +104,10 @@ If you've used Claude Code at least once, it should just work.
 
 ## Changelog
 
+### v2.1.1
+
+Clean exit on Ctrl+C — no more traceback or errno 130 when installed via pip/pipx.
+
 ### v2.1.0
 
 Mascot redesign and rate limit handling.
