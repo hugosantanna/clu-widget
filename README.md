@@ -2,6 +2,7 @@
 
 A terminal tool that monitors your Claude Code usage — from a cute animated widget to a full per-project dashboard.
 
+[![PyPI version](https://img.shields.io/pypi/v/clu-widget)](https://pypi.org/project/clu-widget/)
 ![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue)
 
 ![clu dashboard](screenshot.png)
