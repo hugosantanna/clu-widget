@@ -82,6 +82,22 @@ LIME    = "#a3e635"
 # ── Mood-reactive creature for dashboard ─────────────────────────────────────
 # Moods: chill (0-30%), cozy (30-50%), warm (50-70%), hot (70-90%), fire (90%+)
 
+_EYE_STYLES = ["◕ ◕", "● ●", "◠ ◠", "◉ ◉", "◦ ◦", "• •", "◕ ◕", "○ ○"]
+
+def _make_face(left_eye, right_eye, dash=True):
+    pad = "  " if dash else "      "
+    return f"{pad}[on {SKIN}]  [/][on {DIM_D}] [{VIOLET} on {DIM_D}]{left_eye}[/][on {DIM_D}]  [{VIOLET} on {DIM_D}]{right_eye}[/][on {DIM_D}] [/][on {SKIN}]  [/]"
+
+def _get_eyes(tick, dash=True):
+    style_idx = (tick // 40) % len(_EYE_STYLES)
+    pair = _EYE_STYLES[style_idx]
+    left, right = pair.split(" ")
+    return _make_face(left, right, dash)
+
+def _get_blink(dash=True):
+    pad = "  " if dash else "      "
+    return f"{pad}[on {SKIN}]  [/][on {DIM_D}] [{VIOLET} on {DIM_D}]^[/][on {DIM_D}]  [{VIOLET} on {DIM_D}]^[/][on {DIM_D}] [/][on {SKIN}]  [/]"
+
 def get_dash_creature(utilization, tick):
     """Get a happy bouncy creature — chunky pixel-art style."""
     bounce = (tick % 80) < 12  # bounce every 40 seconds
@@ -91,8 +107,8 @@ def get_dash_creature(utilization, tick):
     ant  = f"      [{VIOLET}]*[/]"
     stk  = f"      [{VIOLET}]|[/]"
     top  = f"  [on {SKIN}]          [/]"
-    face  = f"  [on {SKIN}]  [/][on {DIM_D}] [{VIOLET} on {DIM_D}]*[/][on {DIM_D}]  [{VIOLET} on {DIM_D}]*[/][on {DIM_D}] [/][on {SKIN}]  [/]"
-    blink = f"  [on {SKIN}]  [/][on {DIM_D}] [{VIOLET} on {DIM_D}]^[/][on {DIM_D}]  [{VIOLET} on {DIM_D}]^[/][on {DIM_D}] [/][on {SKIN}]  [/]"
+    face  = _get_eyes(tick, dash=True)
+    blink = _get_blink(dash=True)
     chin = f"  [on {SKIN}]          [/]"
     body = f"   [on {SKIN}]        [/]"
     legs = f"   [on {SKIN}]  [/]    [on {SKIN}]  [/]"
@@ -135,42 +151,35 @@ def get_creature_speech(utilization, tick, error_msg=None):
 _W_ANT   = f"          [{VIOLET}]*[/]"
 _W_STK   = f"          [{VIOLET}]|[/]"
 _W_TOP   = f"      [on {SKIN}]          [/]"
-_W_FACE  = f"      [on {SKIN}]  [/][on {DIM_D}] [{VIOLET} on {DIM_D}]*[/][on {DIM_D}]  [{VIOLET} on {DIM_D}]*[/][on {DIM_D}] [/][on {SKIN}]  [/]"
-_W_BLINK = f"      [on {SKIN}]  [/][on {DIM_D}] [{VIOLET} on {DIM_D}]^[/][on {DIM_D}]  [{VIOLET} on {DIM_D}]^[/][on {DIM_D}] [/][on {SKIN}]  [/]"
+_W_BLINK = _get_blink(dash=False)
 _W_CHIN  = f"      [on {SKIN}]          [/]"
 _W_BODY  = f"       [on {SKIN}]        [/]"
 _W_LEGS  = f"       [on {SKIN}]  [/]    [on {SKIN}]  [/]"
-
-CREATURE_IDLE_WIDGET = [
-    [_W_ANT, _W_STK, _W_TOP, _W_FACE, _W_CHIN, _W_BODY, _W_LEGS],
-]
-
-CREATURE_BLINK_WIDGET = [
-    [_W_ANT, _W_STK, _W_TOP, _W_BLINK, _W_CHIN, _W_BODY, _W_LEGS],
-]
-
-CREATURE_BOUNCE_WIDGET = [
-    [_W_ANT, _W_STK, _W_TOP, _W_FACE,  _W_CHIN, _W_BODY, _W_LEGS],
-    [f"",    _W_ANT, _W_TOP, _W_BLINK, _W_CHIN, _W_BODY, f""],
-    [_W_ANT, _W_STK, _W_TOP, _W_BLINK, _W_CHIN, _W_BODY, f""],
-    [f"",    _W_ANT, _W_TOP, _W_FACE,  _W_CHIN, _W_BODY, _W_LEGS],
-]
 
 BOUNCE_INTERVAL = 120
 BOUNCE_FRAME_HOLD = 3
 
 def get_creature_lines_widget(tick):
     """Return the creature lines for widget mode."""
+    face = _get_eyes(tick, dash=False)
+    blink = _W_BLINK
+
     cycle_pos = tick % BOUNCE_INTERVAL
-    bounce_total_ticks = len(CREATURE_BOUNCE_WIDGET) * BOUNCE_FRAME_HOLD
+    bounce_frames = [
+        [_W_ANT, _W_STK, _W_TOP, face,  _W_CHIN, _W_BODY, _W_LEGS],
+        [f"",    _W_ANT, _W_TOP, blink, _W_CHIN, _W_BODY, f""],
+        [_W_ANT, _W_STK, _W_TOP, blink, _W_CHIN, _W_BODY, f""],
+        [f"",    _W_ANT, _W_TOP, face,  _W_CHIN, _W_BODY, _W_LEGS],
+    ]
+    bounce_total_ticks = len(bounce_frames) * BOUNCE_FRAME_HOLD
     if cycle_pos < bounce_total_ticks:
         frame_idx = cycle_pos // BOUNCE_FRAME_HOLD
-        return CREATURE_BOUNCE_WIDGET[frame_idx]
+        return bounce_frames[frame_idx]
     # Blink every ~10 seconds for 1 second
     elif (tick % 20) in (0, 1):
-        return CREATURE_BLINK_WIDGET[0]
+        return [_W_ANT, _W_STK, _W_TOP, blink, _W_CHIN, _W_BODY, _W_LEGS]
     else:
-        return CREATURE_IDLE_WIDGET[0]
+        return [_W_ANT, _W_STK, _W_TOP, face, _W_CHIN, _W_BODY, _W_LEGS]
 
 
 # ── Formatting helpers ───────────────────────────────────────────────────────
@@ -397,7 +406,7 @@ class UsageHistory:
             self.samples_7d = self.samples_7d[-self.max_samples:]
             self.timestamps = self.timestamps[-self.max_samples:]
 
-    def render_chart(self, width=30, height=6, show_7d=False):
+    def render_chart(self, width=20, height=6, show_7d=False):
         """Render a real-time ASCII chart of utilization over time."""
         samples = self.samples_5h if not show_7d else self.samples_7d
         color = AMBER_L if not show_7d else VIOLET
@@ -431,7 +440,7 @@ class UsageHistory:
 
             r.append("│", style=DIM)
 
-            # Plot each sample
+            # Plot each sample (2 chars wide per bar)
             for v in vals:
                 v_pos = (v / mx) * (height - 1) if mx > 0 else 0
                 filled_row = height - 1 - row_idx  # row 0 is top
@@ -440,22 +449,22 @@ class UsageHistory:
                     elif v >= 70: c = ORANGE
                     elif v >= 40: c = color
                     else:         c = GREEN
-                    r.append("█", style=c)
+                    r.append("██", style=c)
                 elif v_pos >= filled_row:
                     if v >= 90:   c = RED
                     elif v >= 70: c = ORANGE
                     elif v >= 40: c = color
                     else:         c = GREEN
-                    r.append("▄", style=c)
+                    r.append("▄▄", style=c)
                 else:
-                    r.append(" ")
+                    r.append("  ")
 
             rows.append(r)
 
         # Bottom axis
         axis = Text()
         axis.append("   └", style=DIM)
-        axis.append("─" * len(vals), style=DIM)
+        axis.append("─" * (len(vals) * 2), style=DIM)
         rows.append(axis)
 
         # Label
@@ -1289,7 +1298,7 @@ def make_dashboard(api_data, local_data, last_ok, error_msg, tick, data_dirs_inf
     # ── CHART PANEL: Real-time usage graph ──────────────────────────────
     if usage_history and len(usage_history.samples_5h) >= 1:
         chart_content_rows = []
-        chart_content_rows.append(usage_history.render_chart(width=30, height=5, show_7d=False))
+        chart_content_rows.append(usage_history.render_chart(width=20, height=7, show_7d=False))
         chart_content = Text("\n").join(chart_content_rows)
         n_pts = len(usage_history.samples_5h)
         elapsed_s = n_pts * 30
@@ -1324,7 +1333,7 @@ def make_dashboard(api_data, local_data, last_ok, error_msg, tick, data_dirs_inf
         )
         layout["bottom_left"].update(proj_panel)
         layout["bottom_right"].split_column(
-            Layout(chart_panel, name="chart", ratio=2),
+            Layout(chart_panel, name="chart", ratio=3),
             Layout(sess_panel, name="sessions", ratio=3),
         )
     else:
