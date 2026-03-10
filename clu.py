@@ -82,50 +82,41 @@ LIME    = "#a3e635"
 # ── Mood-reactive creature for dashboard ─────────────────────────────────────
 # Moods: chill (0-30%), cozy (30-50%), warm (50-70%), hot (70-90%), fire (90%+)
 
-_EYE_STYLES = ["◕ ◕", "● ●", "◠ ◠", "◉ ◉", "◦ ◦", "• •", "◕ ◕", "○ ○"]
+_EYE_STYLES = ["⌒ ⌒", "◕ ◕", "● ●", "◠ ◠", "◉ ◉", "◦ ◦", "• •", "○ ○"]
 
-def _make_face(left_eye, right_eye, dash=True):
-    pad = "  " if dash else "      "
-    return f"{pad}[on {SKIN}]  [/][on {DIM_D}] [{VIOLET} on {DIM_D}]{left_eye}[/][on {DIM_D}]  [{VIOLET} on {DIM_D}]{right_eye}[/][on {DIM_D}] [/][on {SKIN}]  [/]"
-
-def _get_eyes(tick, dash=True):
+def _get_eyes_pair(tick):
+    """Return (left_eye, right_eye) rotating through styles."""
     style_idx = (tick // 40) % len(_EYE_STYLES)
     pair = _EYE_STYLES[style_idx]
     left, right = pair.split(" ")
-    return _make_face(left, right, dash)
-
-def _get_blink(dash=True):
-    pad = "  " if dash else "      "
-    return f"{pad}[on {SKIN}]  [/][on {DIM_D}] [{VIOLET} on {DIM_D}]^[/][on {DIM_D}]  [{VIOLET} on {DIM_D}]^[/][on {DIM_D}] [/][on {SKIN}]  [/]"
+    return left, right
 
 def get_dash_creature(utilization, tick):
-    """Get a happy bouncy creature — chunky pixel-art style."""
-    bounce = (tick % 80) < 12  # bounce every 40 seconds
+    """Get a happy bouncy creature — line-art style with rotating eyes."""
+    bounce = (tick % 80) < 12
     frame = (tick % 80) // 3 if bounce else -1
 
-    # Background-colored spaces — no block chars, no line-gap stripes
-    ant  = f"      [{VIOLET}]*[/]"
-    stk  = f"      [{VIOLET}]|[/]"
-    top  = f"  [on {SKIN}]          [/]"
-    face  = _get_eyes(tick, dash=True)
-    blink = _get_blink(dash=True)
-    chin = f"  [on {SKIN}]          [/]"
-    body = f"   [on {SKIN}]        [/]"
-    legs = f"   [on {SKIN}]  [/]    [on {SKIN}]  [/]"
+    left, right = _get_eyes_pair(tick)
+    ant   = f"   [{VIOLET}]*[/]"
+    stk   = f"   [{VIOLET}]|[/]"
+    top   = f" [{SKIN}]┌────┐[/]"
+    face  = f" [{SKIN}]│[/][{VIOLET}]{left}[/] [{VIOLET}]{right}[/][{SKIN}]│[/]"
+    blink = f" [{SKIN}]│[/][{VIOLET}]^[/] [{VIOLET}]^[/][{SKIN}]│[/]"
+    chin  = f" [{SKIN}]└┬──┬┘[/]"
+    legs  = f" [{SKIN}] │  │[/]"
 
-    # Blink every ~10 seconds for 1 second
     is_blink = (tick % 20) in (0, 1)
     eyes = blink if is_blink else face
 
     if bounce and 0 <= frame < 4:
         frames = [
-            [ant, stk, top, eyes, chin, body, legs],
-            [f"", ant, top, blink, chin, body, f""],
-            [ant, stk, top, blink, chin, body, f""],
-            [f"", ant, top, eyes, chin, body, legs],
+            [ant, stk, top, eyes, chin, legs],
+            [f"", ant, top, blink, f" [{SKIN}]└────┘[/]", f""],
+            [ant, stk, top, blink, f" [{SKIN}]└────┘[/]", f""],
+            [f"", ant, top, eyes, chin, legs],
         ]
         return frames[frame]
-    return [ant, stk, top, eyes, chin, body, legs]
+    return [ant, stk, top, eyes, chin, legs]
 
 
 def get_creature_speech(utilization, tick, error_msg=None):
@@ -147,29 +138,29 @@ def get_creature_speech(utilization, tick, error_msg=None):
 
 
 # ── Original widget creature (wider spacing for 46-col widget) ───────────────
-# Background-colored spaces — no block chars, no line-gap stripes
 _W_ANT   = f"          [{VIOLET}]*[/]"
 _W_STK   = f"          [{VIOLET}]|[/]"
-_W_TOP   = f"      [on {SKIN}]          [/]"
-_W_BLINK = _get_blink(dash=False)
-_W_CHIN  = f"      [on {SKIN}]          [/]"
-_W_BODY  = f"       [on {SKIN}]        [/]"
-_W_LEGS  = f"       [on {SKIN}]  [/]    [on {SKIN}]  [/]"
+_W_TOP   = f"        [{SKIN}]┌────┐[/]"
+_W_BLINK = f"        [{SKIN}]│[/][{VIOLET}]^[/] [{VIOLET}]^[/][{SKIN}]│[/]"
+_W_CHIN  = f"        [{SKIN}]└┬──┬┘[/]"
+_W_LEGS  = f"        [{SKIN}] │  │[/]"
 
 BOUNCE_INTERVAL = 120
 BOUNCE_FRAME_HOLD = 3
 
-def get_creature_lines_widget(tick):
-    """Return the creature lines for widget mode."""
-    face = _get_eyes(tick, dash=False)
-    blink = _W_BLINK
+def _w_face(tick):
+    left, right = _get_eyes_pair(tick)
+    return f"        [{SKIN}]│[/][{VIOLET}]{left}[/] [{VIOLET}]{right}[/][{SKIN}]│[/]"
 
+def get_creature_lines_widget(tick):
+    """Return the creature lines for widget mode — line-art with rotating eyes."""
+    face = _w_face(tick)
     cycle_pos = tick % BOUNCE_INTERVAL
     bounce_frames = [
-        [_W_ANT, _W_STK, _W_TOP, face,  _W_CHIN, _W_BODY, _W_LEGS],
-        [f"",    _W_ANT, _W_TOP, blink, _W_CHIN, _W_BODY, f""],
-        [_W_ANT, _W_STK, _W_TOP, blink, _W_CHIN, _W_BODY, f""],
-        [f"",    _W_ANT, _W_TOP, face,  _W_CHIN, _W_BODY, _W_LEGS],
+        [_W_ANT, _W_STK, _W_TOP, face,     _W_CHIN, _W_LEGS],
+        [f"",    _W_ANT, _W_TOP, _W_BLINK, f"        [{SKIN}]└────┘[/]", f""],
+        [_W_ANT, _W_STK, _W_TOP, _W_BLINK, f"        [{SKIN}]└────┘[/]", f""],
+        [f"",    _W_ANT, _W_TOP, face,      _W_CHIN, _W_LEGS],
     ]
     bounce_total_ticks = len(bounce_frames) * BOUNCE_FRAME_HOLD
     if cycle_pos < bounce_total_ticks:
@@ -177,9 +168,9 @@ def get_creature_lines_widget(tick):
         return bounce_frames[frame_idx]
     # Blink every ~10 seconds for 1 second
     elif (tick % 20) in (0, 1):
-        return [_W_ANT, _W_STK, _W_TOP, blink, _W_CHIN, _W_BODY, _W_LEGS]
+        return [_W_ANT, _W_STK, _W_TOP, _W_BLINK, _W_CHIN, _W_LEGS]
     else:
-        return [_W_ANT, _W_STK, _W_TOP, face, _W_CHIN, _W_BODY, _W_LEGS]
+        return [_W_ANT, _W_STK, _W_TOP, face, _W_CHIN, _W_LEGS]
 
 
 # ── Formatting helpers ───────────────────────────────────────────────────────
@@ -682,9 +673,8 @@ def fetch_usage(token):
                     _save_cached_usage(data)
                     return data
                 elif resp.status_code == 429:
-                    retry_after = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
-                    secs = int(retry_after) if retry_after and retry_after.isdigit() else None
-                    raise RateLimited(secs)
+                    # Don't raise — fall through to OAuth fallback
+                    pass
                 elif resp.status_code in (401, 403):
                     # Session expired — clear cookie so we re-fetch next time
                     _scraper.cookies.clear()
@@ -702,6 +692,8 @@ def fetch_usage(token):
     if resp.status_code == 429:
         retry_after = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
         secs = int(retry_after) if retry_after and retry_after.isdigit() else None
+        if secs is not None:
+            secs = min(secs, REFRESH_SECS * 2)  # cap to avoid absurd waits
         raise RateLimited(secs)
     resp.raise_for_status()
     data = resp.json()
