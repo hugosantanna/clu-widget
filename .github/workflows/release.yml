@@ -1,4 +1,4 @@
-name: Auto Release
+name: Auto Release & Publish
 
 on:
   push:
@@ -10,6 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+    environment: pypi
     steps:
       - uses: actions/checkout@v4
 
@@ -34,3 +36,16 @@ jobs:
         run: gh release create "${{ steps.version.outputs.tag }}" --generate-notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        if: steps.check.outputs.exists == 'false'
+        with:
+          python-version: "3.13"
+
+      - name: Build package
+        if: steps.check.outputs.exists == 'false'
+        run: pip install build && python -m build
+
+      - name: Publish to PyPI
+        if: steps.check.outputs.exists == 'false'
+        uses: pypa/gh-action-pypi-publish@release/v1
