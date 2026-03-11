@@ -2,7 +2,7 @@
   "name": "clu",
   "displayName": "clu — Claude Usage Monitor",
   "description": "Real-time Claude Code token usage in your status bar + dashboard panel",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "publisher": "hsantanna",
   "license": "MIT",
   "repository": {

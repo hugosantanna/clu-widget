@@ -633,7 +633,7 @@ ${warning ? `<div class="warning-bar">⚠ ${escHtml(warning)}</div>` : ''}
     }
   }
 
-  setInterval(animateTick, 100);
+  setInterval(animateTick, 500);
 
   // ── Countdown timers ──────────────────────────────────────────────────
   const fhResetIso = ${fh.resets_at ? JSON.stringify(fh.resets_at) : 'null'};
