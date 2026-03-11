@@ -2,8 +2,9 @@
 
 A terminal tool that monitors your Claude Code usage — from a cute animated widget to a full per-project dashboard.
 
-[![PyPI version](https://img.shields.io/pypi/v/clu-widget)](https://pypi.org/project/clu-widget/)
-![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue)
+[![PyPI version](https://img.shields.io/pypi/v/clu-widget?color=orange)](https://pypi.org/project/clu-widget/)
+![Python 3.9+](https://img.shields.io/badge/python-3.9+-3776ab)
+[![VS Code Marketplace](https://img.shields.io/visual-studio-marketplace/v/hsantanna.clu?color=007acc&label=vscode)](https://marketplace.visualstudio.com/items?itemName=hsantanna.clu)
 
 ![clu dashboard](screenshot.png)
 
