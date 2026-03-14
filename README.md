@@ -43,7 +43,7 @@ pip install clu-widget
 
 # Or install from source
 git clone https://github.com/hugosantanna/clu-widget.git
-cd clu
+cd clu-widget
 pip install .
 ```
 

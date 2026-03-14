@@ -619,13 +619,15 @@ def _decrypt_session_key_macos():
 
         fd, tmp = tempfile.mkstemp(suffix=".db")
         os.close(fd)
-        shutil.copy2(str(cookie_db), tmp)
-        conn = sqlite3.connect(tmp)
-        cur = conn.cursor()
-        cur.execute("SELECT encrypted_value FROM cookies WHERE name='sessionKey' AND host_key LIKE '%claude%'")
-        row = cur.fetchone()
-        conn.close()
-        os.unlink(tmp)
+        try:
+            shutil.copy2(str(cookie_db), tmp)
+            conn = sqlite3.connect(tmp)
+            cur = conn.cursor()
+            cur.execute("SELECT encrypted_value FROM cookies WHERE name='sessionKey' AND host_key LIKE '%claude%'")
+            row = cur.fetchone()
+            conn.close()
+        finally:
+            os.unlink(tmp)
 
         if row and row[0][:3] == b"v10":
             enc_data = row[0][3:]
@@ -696,13 +698,15 @@ def _decrypt_session_key_windows():
         # Read cookie from database
         fd, tmp = tempfile.mkstemp(suffix=".db")
         os.close(fd)
-        shutil.copy2(str(cookie_db), tmp)
-        conn = sqlite3.connect(tmp)
-        cur = conn.cursor()
-        cur.execute("SELECT encrypted_value FROM cookies WHERE name='sessionKey' AND host_key LIKE '%claude%'")
-        row = cur.fetchone()
-        conn.close()
-        os.unlink(tmp)
+        try:
+            shutil.copy2(str(cookie_db), tmp)
+            conn = sqlite3.connect(tmp)
+            cur = conn.cursor()
+            cur.execute("SELECT encrypted_value FROM cookies WHERE name='sessionKey' AND host_key LIKE '%claude%'")
+            row = cur.fetchone()
+            conn.close()
+        finally:
+            os.unlink(tmp)
 
         if row and row[0][:3] == b"v10":
             nonce = row[0][3:15]       # 12-byte nonce
@@ -755,13 +759,15 @@ def _decrypt_session_key_linux():
         # Read cookie from database
         fd, tmp = tempfile.mkstemp(suffix=".db")
         os.close(fd)
-        shutil.copy2(str(cookie_db), tmp)
-        conn = sqlite3.connect(tmp)
-        cur = conn.cursor()
-        cur.execute("SELECT encrypted_value FROM cookies WHERE name='sessionKey' AND host_key LIKE '%claude%'")
-        row = cur.fetchone()
-        conn.close()
-        os.unlink(tmp)
+        try:
+            shutil.copy2(str(cookie_db), tmp)
+            conn = sqlite3.connect(tmp)
+            cur = conn.cursor()
+            cur.execute("SELECT encrypted_value FROM cookies WHERE name='sessionKey' AND host_key LIKE '%claude%'")
+            row = cur.fetchone()
+            conn.close()
+        finally:
+            os.unlink(tmp)
 
         if row and row[0][:3] in (b"v10", b"v11"):
             enc_data = row[0][3:]
