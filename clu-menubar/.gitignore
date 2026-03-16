@@ -1,0 +1,6 @@
+.build/
+CLUMenuBar.app/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+DerivedData/
+.swiftpm/

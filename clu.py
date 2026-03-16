@@ -367,6 +367,51 @@ def get_burn_rate(daily_tokens):
     return today_tokens / hours_elapsed
 
 
+# ── Promo detection ──────────────────────────────────────────────────────────
+
+def detect_promo(api_data, history_samples=None):
+    """Detect 2x usage promo from API response or heuristics.
+
+    Returns (is_promo: bool, label: str).
+    """
+    if not api_data:
+        return False, ""
+
+    # Layer 1: Check known promo fields
+    iguana = api_data.get("iguana_necktie")
+    if iguana and isinstance(iguana, dict):
+        mult = iguana.get("multiplier", iguana.get("factor", 2))
+        return True, f"{mult}x PROMO"
+
+    # Layer 2: Scan for any promo-like keys
+    promo_keywords = {"promo", "bonus", "multiplier", "double", "boost"}
+    for key, val in api_data.items():
+        if any(kw in key.lower() for kw in promo_keywords):
+            if val is not None and val != False and val != 0:
+                return True, "2x PROMO"
+
+    # Layer 3: Capacity heuristic from persistent history
+    if history_samples and len(history_samples) > 100:
+        recent = history_samples[-10:]
+        older = history_samples[-500:-100]
+
+        def avg_tpp(samples):
+            valid = [(s["tok"], s["5h"]) for s in samples
+                     if s.get("5h", 0) > 5 and s.get("tok", 0) > 0]
+            if len(valid) < 3:
+                return None
+            return sum(t / p for t, p in valid) / len(valid)
+
+        recent_tpp = avg_tpp(recent)
+        older_tpp = avg_tpp(older)
+
+        if recent_tpp and older_tpp and recent_tpp > older_tpp * 1.7:
+            return True, "2x PROMO"
+
+    return False, ""
+
+PROMO_STYLE = f"bold {YELLOW} on #78350f"
+
 # ── Real-time usage history ───────────────────────────────────────────────────
 
 class UsageHistory:
@@ -377,6 +422,16 @@ class UsageHistory:
         self.samples_5h = []
         self.samples_7d = []
         self.timestamps = []
+
+    def load_from_persistent(self, history_samples):
+        """Backfill ring buffer from persistent history samples."""
+        if not history_samples:
+            return
+        recent = history_samples[-self.max_samples:]
+        for s in recent:
+            self.samples_5h.append(s.get("5h", 0))
+            self.samples_7d.append(s.get("7d", 0))
+            self.timestamps.append(s.get("ts", 0))
 
     def record(self, api_data):
         """Record a new sample from API data."""
@@ -470,6 +525,352 @@ class UsageHistory:
         return Text("\n").join(rows)
 
 
+# ── Pace & cumulative charts ─────────────────────────────────────────────────
+
+def compute_pace(api_data):
+    """Compute pace % = (actual_pct / expected_pct_at_this_time) × 100.
+
+    Returns (pace_pct, elapsed_ratio) or (None, None) if insufficient data.
+    """
+    if not api_data:
+        return None, None
+    fh = api_data.get("five_hour") or api_data.get("fiveHour") or {}
+    actual_pct = fh.get("utilization") or 0
+    reset_iso = fh.get("resets_at")
+    if not reset_iso or not isinstance(reset_iso, str):
+        return None, None
+    try:
+        target = datetime.fromisoformat(reset_iso)
+        if target.tzinfo is None:
+            target = target.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        secs_left = max(0, (target - now).total_seconds())
+        window_secs = 5 * 3600
+        elapsed_ratio = 1.0 - (secs_left / window_secs)
+        elapsed_ratio = min(max(elapsed_ratio, 0.01), 1.0)  # avoid div by zero
+        expected_pct = elapsed_ratio * 100  # even distribution target
+        pace = (actual_pct / expected_pct) * 100 if expected_pct > 0 else 0
+        return round(pace, 1), elapsed_ratio
+    except Exception:
+        return None, None
+
+def _downsample(values, n):
+    """Reduce a list to n points by averaging adjacent groups."""
+    if len(values) <= n:
+        return values
+    chunk = len(values) / n
+    result = []
+    for i in range(n):
+        start = int(i * chunk)
+        end = int((i + 1) * chunk)
+        group = values[start:end]
+        result.append(sum(group) / len(group) if group else 0)
+    return result
+
+def render_cumulative_chart(history_samples, api_data, width=36, height=8):
+    """Render cumulative usage chart with budget line, actual line, and prediction.
+
+    The budget line shows even distribution (diagonal from 0% to 100%).
+    The actual line shows real utilization over the current 5h window.
+    """
+    if not api_data:
+        t = Text()
+        t.append("  waiting for data\u2026", style=DIM)
+        return t
+
+    fh = api_data.get("five_hour") or api_data.get("fiveHour") or {}
+    reset_iso = fh.get("resets_at")
+    current_pct = fh.get("utilization") or 0
+
+    # Determine window boundaries
+    now = datetime.now(timezone.utc)
+    window_secs = 5 * 3600
+    try:
+        reset_time = datetime.fromisoformat(reset_iso)
+        if reset_time.tzinfo is None:
+            reset_time = reset_time.replace(tzinfo=timezone.utc)
+        window_start = reset_time - timedelta(seconds=window_secs)
+    except Exception:
+        window_start = now - timedelta(hours=5)
+        reset_time = now
+
+    elapsed_secs = (now - window_start).total_seconds()
+    elapsed_ratio = min(max(elapsed_secs / window_secs, 0), 1.0)
+    total_cols = width  # columns representing the full 5h window
+
+    # Filter history samples to current window
+    window_start_ts = window_start.timestamp()
+    now_ts = now.timestamp()
+    window_samples = []
+    if history_samples:
+        window_samples = [s for s in history_samples if s.get("ts", 0) >= window_start_ts]
+
+    # Build actual values: map each sample to its position in the window
+    # Then interpolate/downsample to fit width
+    actual_cols = max(1, int(elapsed_ratio * total_cols))
+
+    if window_samples:
+        # Map samples to column positions and take the value at each column
+        actual_values = []
+        for col in range(actual_cols):
+            col_time = window_start_ts + (col / total_cols) * window_secs
+            # Find closest sample at or before this time
+            best = None
+            for s in window_samples:
+                if s["ts"] <= col_time + 120:  # 2min tolerance
+                    best = s
+            actual_values.append(best["5h"] if best else 0)
+    else:
+        # No history in window — just show current value at the end
+        actual_values = [current_pct]
+        actual_cols = 1
+
+    # Pad actual_values to actual_cols if needed
+    if len(actual_values) < actual_cols:
+        actual_values.extend([actual_values[-1] if actual_values else 0] * (actual_cols - len(actual_values)))
+
+    # Compute prediction: extend from current value at current rate
+    pace_pct, _ = compute_pace(api_data)
+    if pace_pct and pace_pct > 0 and actual_cols < total_cols:
+        remaining_cols = total_cols - actual_cols
+        # Predict: extrapolate linearly from current utilization at current pace
+        current_rate = current_pct / elapsed_ratio if elapsed_ratio > 0 else 0  # rate per 100% of window
+        pred_values = []
+        for i in range(remaining_cols):
+            future_ratio = elapsed_ratio + ((i + 1) / total_cols)
+            pred_pct = min(100, current_rate * future_ratio)
+            pred_values.append(pred_pct)
+    else:
+        pred_values = []
+
+    # Build the chart grid
+    rows = []
+    y_labels = {0: "100", height // 4: " 75", height // 2: " 50", 3 * height // 4: " 25", height - 1: "  0"}
+
+    for row_idx in range(height):
+        r = Text()
+        # Y-axis label
+        r.append(y_labels.get(row_idx, "   "), style=DIM)
+        r.append("\u2502", style=DIM)  # │
+
+        # The value this row represents (top = 100, bottom = 0)
+        row_value = 100 * (height - 1 - row_idx) / (height - 1)
+
+        for col in range(total_cols):
+            col_ratio = (col + 0.5) / total_cols  # position in window (0-1)
+            budget_value = col_ratio * 100  # even distribution value at this column
+
+            # Determine what to draw at this cell
+            is_actual_zone = col < actual_cols
+            is_pred_zone = col >= actual_cols and (col - actual_cols) < len(pred_values)
+
+            if is_actual_zone:
+                actual_val = actual_values[min(col, len(actual_values) - 1)]
+            elif is_pred_zone:
+                actual_val = pred_values[col - actual_cols]
+            else:
+                actual_val = 0
+
+            # Budget line: draw if this row is the closest to budget_value
+            budget_row_pos = (budget_value / 100) * (height - 1)
+            is_budget_row = abs((height - 1 - row_idx) - budget_row_pos) < 0.6
+
+            # Actual/pred line: draw if this row is at or below the value
+            actual_row_pos = (actual_val / 100) * (height - 1)
+            is_at_actual = abs((height - 1 - row_idx) - actual_row_pos) < 0.6
+            is_below_actual = (height - 1 - row_idx) < actual_row_pos
+
+            if is_actual_zone and (is_at_actual or is_below_actual):
+                # Filled area under actual line
+                if actual_val >= 90:     c = RED
+                elif actual_val >= 70:   c = ORANGE
+                elif actual_val >= 40:   c = AMBER_L
+                else:                    c = GREEN
+                if is_at_actual:
+                    r.append("\u2584", style=c)  # ▄ top of fill
+                else:
+                    r.append("\u2588", style=c)  # █ solid fill
+            elif is_pred_zone and is_at_actual:
+                r.append("\u00b7", style=CYAN)  # · prediction dot
+            elif is_budget_row:
+                r.append("\u2571", style=DIM)   # ╱ budget diagonal
+            else:
+                # Subtle threshold lines
+                if row_idx == height // 5:       # ~80% line
+                    r.append("\u00b7", style=DIM_D)
+                elif row_idx == height // 2:     # 50% line
+                    r.append("\u00b7", style=DIM_D)
+                else:
+                    r.append(" ")
+
+        rows.append(r)
+
+    # Bottom axis
+    axis = Text()
+    axis.append("   \u2514", style=DIM)  # └
+    axis.append("\u2500" * total_cols, style=DIM)  # ─
+    rows.append(axis)
+
+    # Time labels
+    time_row = Text()
+    time_row.append("    ", style=DIM)
+    start_label = window_start.strftime("%H:%M") if window_start else ""
+    # Place "now" marker at the elapsed position
+    now_col = int(elapsed_ratio * total_cols)
+    end_label = reset_time.strftime("%H:%M") if reset_time else ""
+    # Build label: start ... now ... end
+    label_line = list(" " * total_cols)
+    for i, ch in enumerate(start_label):
+        if i < total_cols:
+            label_line[i] = ch
+    now_label = "now"
+    now_start = max(len(start_label) + 1, min(now_col - 1, total_cols - len(now_label)))
+    for i, ch in enumerate(now_label):
+        if now_start + i < total_cols:
+            label_line[now_start + i] = ch
+    end_start = max(now_start + len(now_label) + 1, total_cols - len(end_label))
+    for i, ch in enumerate(end_label):
+        if end_start + i < total_cols:
+            label_line[end_start + i] = ch
+    time_row.append("".join(label_line), style=MUTED)
+    rows.append(time_row)
+
+    # Legend
+    legend = Text()
+    legend.append("    ", style=DIM)
+    legend.append("\u2500\u2500", style=AMBER_L)  # ── actual
+    legend.append(" actual  ", style=DIM)
+    legend.append("\u2571", style=DIM)            # ╱ even
+    legend.append(" even  ", style=DIM)
+    legend.append("\u00b7\u00b7", style=CYAN)     # ·· prediction
+    legend.append(" pred", style=DIM)
+    rows.append(legend)
+
+    return Text("\n").join(rows)
+
+
+def render_rate_chart(history_samples, width=36, height=4):
+    """Render consumption rate (derivative) as a sparkline bar chart.
+
+    Shows how fast usage is changing — bursts vs quiet periods.
+    """
+    if not history_samples or len(history_samples) < 3:
+        return None
+
+    # Filter to last 5 hours
+    cutoff = time.time() - 5 * 3600
+    recent = [s for s in history_samples if s.get("ts", 0) >= cutoff]
+    if len(recent) < 3:
+        return None
+
+    # Compute deltas (rate of change between consecutive samples)
+    deltas = []
+    for i in range(1, len(recent)):
+        dt = recent[i]["ts"] - recent[i - 1]["ts"]
+        if dt > 0:
+            d_pct = max(0, recent[i]["5h"] - recent[i - 1]["5h"])
+            rate = d_pct / (dt / 60)  # %/min
+            deltas.append(rate)
+
+    if not deltas:
+        return None
+
+    # Downsample to fit width
+    vals = _downsample(deltas, width)
+    mx = max(vals) if vals and max(vals) > 0 else 1
+
+    # Compute peak and average
+    peak_delta = max(deltas)
+    avg_delta = sum(deltas) / len(deltas)
+
+    rows = []
+
+    # Header with metrics
+    header = Text()
+    header.append("  peak ", style=DIM)
+    header.append(f"{peak_delta:.2f}", style=f"bold {ORANGE}")
+    header.append("%/min  avg ", style=DIM)
+    header.append(f"{avg_delta:.3f}", style=f"bold {MUTED}")
+    header.append("%/min", style=DIM)
+    rows.append(header)
+
+    # Bar chart (sparkline style, using block chars)
+    blocks = " \u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"  # ▁▂▃▄▅▆▇█
+    sp = Text()
+    sp.append("  ")
+    for v in vals:
+        ratio = v / mx if mx > 0 else 0
+        idx = min(int(ratio * (len(blocks) - 1)), len(blocks) - 1)
+        if ratio > 0.7:   c = ORANGE
+        elif ratio > 0.3: c = AMBER_L
+        else:              c = DIM
+        sp.append(blocks[idx], style=c)
+    rows.append(sp)
+
+    return Text("\n").join(rows)
+
+
+def render_heatmap(daily_tokens, weeks=5):
+    """Render a GitHub-style contribution heatmap for daily token usage."""
+    if not daily_tokens:
+        return None
+
+    today = datetime.now(timezone.utc).date()
+    # Build grid: rows=weekdays (Mon=0..Sun=6), cols=weeks
+    total_days = weeks * 7
+    start_date = today - timedelta(days=total_days - 1)
+    # Align to Monday
+    start_date = start_date - timedelta(days=start_date.weekday())
+
+    # Collect values
+    grid = {}
+    mx = 0
+    for d in range(total_days + 7):  # extra week for alignment
+        day = start_date + timedelta(days=d)
+        if day > today:
+            break
+        key = day.strftime("%Y-%m-%d")
+        val = daily_tokens.get(key, 0)
+        grid[day] = val
+        if val > mx:
+            mx = val
+
+    if mx == 0:
+        return None
+
+    # Intensity levels
+    levels = [
+        (0, DIM_D, "\u2591"),       # ░ empty
+        (0.01, GREEN, "\u25aa"),    # ▪ low
+        (0.25, CYAN, "\u25aa"),     # ▪ medium-low
+        (0.50, AMBER_L, "\u25aa"), # ▪ medium-high
+        (0.75, ORANGE, "\u25aa"),  # ▪ high
+    ]
+    day_labels = {0: "M", 2: "W", 4: "F"}
+
+    rows = []
+    for weekday in range(7):
+        r = Text()
+        label = day_labels.get(weekday, " ")
+        r.append(f"  {label} ", style=MUTED)
+        for week in range(weeks):
+            day = start_date + timedelta(days=week * 7 + weekday)
+            if day > today:
+                r.append(" ")
+                continue
+            val = grid.get(day, 0)
+            ratio = val / mx if mx > 0 else 0
+            # Find appropriate level
+            color, char = levels[0][1], levels[0][2]
+            for threshold, c, ch in levels:
+                if ratio >= threshold:
+                    color, char = c, ch
+            r.append(char + " ", style=color)
+        rows.append(r)
+
+    return Text("\n").join(rows)
+
+
 # ── Token resolution ──────────────────────────────────────────────────────────
 
 def get_token():
@@ -542,6 +943,8 @@ class RateLimited(Exception):
         super().__init__(f"429 rate limited (retry after {retry_after}s)")
 
 _CACHE_FILE = Path.home() / ".claude" / ".clu_cache.json"
+_HISTORY_FILE = Path.home() / ".claude" / ".clu_history.json"
+_HISTORY_MAX_AGE = 30 * 86400  # 30 days in seconds
 
 def _load_cached_usage():
     """Load last successful API response from disk cache."""
@@ -565,6 +968,55 @@ def _save_cached_usage(data):
         _CACHE_FILE.chmod(0o600)
     except Exception:
         pass
+
+def _load_history():
+    """Load persistent usage history from disk, pruning old samples."""
+    try:
+        if not _HISTORY_FILE.exists():
+            return []
+        data = json.loads(_HISTORY_FILE.read_text())
+        if data.get("v") != 1:
+            return []
+        samples = data.get("samples", [])
+        cutoff = time.time() - _HISTORY_MAX_AGE
+        pruned = [s for s in samples if s.get("ts", 0) >= cutoff]
+        # Write back if we pruned anything
+        if len(pruned) < len(samples):
+            _save_history(pruned)
+        return pruned
+    except Exception:
+        return []
+
+def _save_history(samples):
+    """Write history samples to disk atomically."""
+    try:
+        tmp = _HISTORY_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"v": 1, "samples": samples}))
+        tmp.chmod(0o600)
+        os.replace(str(tmp), str(_HISTORY_FILE))
+    except Exception:
+        pass
+
+_last_history_ts = 0  # debounce guard
+
+def _save_history_sample(api_data):
+    """Append a single sample to persistent history (debounced to 60s)."""
+    global _last_history_ts
+    now = time.time()
+    if now - _last_history_ts < 60:
+        return
+    if not api_data:
+        return
+    fh = api_data.get("five_hour") or api_data.get("fiveHour") or {}
+    sd = api_data.get("seven_day") or api_data.get("sevenDay") or {}
+    fh_pct = fh.get("utilization") or 0
+    sd_pct = sd.get("utilization") or 0
+    tok = (fh.get("input_tokens") or 0) + (fh.get("output_tokens") or 0)
+    sample = {"ts": int(now), "5h": round(fh_pct, 1), "7d": round(sd_pct, 1), "tok": tok}
+    samples = _load_history()
+    samples.append(sample)
+    _save_history(samples)
+    _last_history_ts = now
 
 _SESSION_KEY_FILE = Path.home() / ".claude" / ".clu_session_key"
 
@@ -1175,7 +1627,7 @@ def parse_project_data(data_dirs):
 
 # ── Dashboard rendering ──────────────────────────────────────────────────────
 
-def make_dashboard(api_data, local_data, last_ok, error_msg, tick, data_dirs_info, usage_history=None, window_hours=5):
+def make_dashboard(api_data, local_data, last_ok, error_msg, tick, data_dirs_info, usage_history=None, window_hours=5, history_samples=None):
     """Build the full dashboard layout — with personality."""
 
     now_str = datetime.now().strftime("%H:%M:%S")
@@ -1213,13 +1665,17 @@ def make_dashboard(api_data, local_data, last_ok, error_msg, tick, data_dirs_inf
 
     hero_rows.append(Text())
 
-    # Plan badge + connection
+    # Plan badge + promo badge + connection
+    is_promo, promo_label = detect_promo(api_data, history_samples)
     if api_data:
         plan = api_data.get("plan") or api_data.get("subscription_type") or ""
         if plan:
             badge_row = Text()
             badge_row.append("  ")
             badge_row.append(f" {plan} ", style=f"bold {VIOLET} on #1e1b4b")
+            if is_promo:
+                badge_row.append("  ")
+                badge_row.append(f" \u26a1 {promo_label} ", style=PROMO_STYLE)
             badge_row.append("  ")
             badge_row.append(dot_char, style=f"bold {dot_color}")
             badge_row.append(f" {now_str}", style=MUTED)
@@ -1315,16 +1771,37 @@ def make_dashboard(api_data, local_data, last_ok, error_msg, tick, data_dirs_inf
     else:
         stats_rows.append(Text("  mostly fresh context", style=DIM))
 
-    # Daily sparkline
+    # Pace indicator
+    pace_pct, _ = compute_pace(api_data)
+    if pace_pct is not None:
+        stats_rows.append(Text())
+        pace_row = Text()
+        pace_row.append("  pace ", style=DIM)
+        if pace_pct <= 100:    pc = GREEN
+        elif pace_pct <= 150:  pc = ORANGE
+        else:                  pc = RED
+        pace_row.append(f"{pace_pct:.0f}%", style=f"bold {pc}")
+        if pace_pct <= 80:     pace_row.append(" under budget", style=DIM)
+        elif pace_pct <= 120:  pace_row.append(" on track", style=DIM)
+        else:                  pace_row.append(" burning fast", style=DIM)
+        stats_rows.append(pace_row)
+
+    # Daily sparkline + heatmap
     if daily:
         stats_rows.append(Text())
         daily_vals = list(daily.values())[-14:]
         sp_row = Text()
         sp_row.append("  ")
         sp_row.append_text(sparkline(daily_vals, width=14))
-        sp_row.append(" ←", style=MUTED)
+        sp_row.append(" \u2190", style=MUTED)
         stats_rows.append(sp_row)
-        stats_rows.append(Text("  daily usage, 14d (← today)", style=DIM))
+        stats_rows.append(Text("  daily usage, 14d (\u2190 today)", style=DIM))
+
+        # Heatmap
+        heatmap = render_heatmap(daily)
+        if heatmap:
+            stats_rows.append(Text())
+            stats_rows.append(heatmap)
 
     # Models
     if models:
@@ -1491,26 +1968,41 @@ def make_dashboard(api_data, local_data, last_ok, error_msg, tick, data_dirs_inf
         padding=(1, 1),
     )
 
-    # ── CHART PANEL: Real-time usage graph ──────────────────────────────
-    if usage_history and len(usage_history.samples_5h) >= 1:
-        chart_content_rows = []
-        chart_content_rows.append(usage_history.render_chart(width=20, height=7, show_7d=False))
-        chart_content = Text("\n").join(chart_content_rows)
-        n_pts = len(usage_history.samples_5h)
-        elapsed_s = n_pts * 30
-        elapsed_m = elapsed_s // 60
-        sub = f"last {elapsed_m}m" if elapsed_m > 0 else "starting…"
+    # ── CHART PANEL: Cumulative usage + budget line + rate ──────────────
+    has_chart = False
+    if api_data or (history_samples and len(history_samples) > 0):
+        chart_rows = []
+
+        # Cumulative usage chart with budget line
+        cum_chart = render_cumulative_chart(history_samples, api_data, width=36, height=8)
+        chart_rows.append(cum_chart)
+
+        # Consumption rate chart (derivative)
+        rate_chart = render_rate_chart(history_samples, width=36, height=4)
+        if rate_chart:
+            chart_rows.append(Text())
+            chart_rows.append(rate_chart)
+
+        chart_content = Text("\n").join(chart_rows)
+
+        # Pace in subtitle
+        pace_pct, _ = compute_pace(api_data)
+        pace_str = ""
+        if pace_pct is not None:
+            if pace_pct <= 100:    pace_color = GREEN
+            elif pace_pct <= 150:  pace_color = ORANGE
+            else:                  pace_color = RED
+            pace_str = f" · pace [{pace_color}]{pace_pct:.0f}%[/]"
+
         chart_panel = Panel(
             chart_content,
-            title=Text.from_markup(f"[bold {AMBER_L}]▤ live[/]"),
-            subtitle=Text.from_markup(f"[{MUTED}]{sub}[/]"),
+            title=Text.from_markup(f"[bold {AMBER_L}]\u25a4 cumulative[/][{MUTED}] \u00b7 5h window[/]"),
+            subtitle=Text.from_markup(f"[{MUTED}]budget vs actual{pace_str}[/]"),
             border_style=DIM,
             box=box.ROUNDED,
             padding=(0, 1),
         )
         has_chart = True
-    else:
-        has_chart = False
 
     # ── Assemble layout ──────────────────────────────────────────────────
     layout = Layout()
@@ -1543,7 +2035,7 @@ def make_dashboard(api_data, local_data, last_ok, error_msg, tick, data_dirs_inf
 
 # ── Widget rendering (original clu) ─────────────────────────────────────────
 
-def make_widget(data, last_ok, error_msg=None, tick=0):
+def make_widget(data, last_ok, error_msg=None, tick=0, history_samples=None):
     """Build the full renderable widget (original cute mode)."""
 
     now_str = datetime.now().strftime("%H:%M:%S")
@@ -1579,13 +2071,19 @@ def make_widget(data, last_ok, error_msg=None, tick=0):
         fh_reset = fh.get("resets_at") or fh.get("time_until_reset_secs")
         sd_reset = sd.get("resets_at") or sd.get("time_until_reset_secs")
 
+        is_promo, promo_label = detect_promo(data, history_samples)
         if plan:
             badge = Text()
             badge.append("  ")
             badge.append(f" {plan} ", style=f"bold {VIOLET} on #1e1b4b")
+            if is_promo:
+                badge.append("  ")
+                badge.append(f" \u26a1 {promo_label} ", style=PROMO_STYLE)
             rows.append(badge)
             rows.append(Text())
 
+        # 5h gauge with pace
+        pace_pct, _ = compute_pace(data)
         label_5h = Text()
         label_5h.append("  5h  ", style=f"bold {AMBER}")
         label_5h.append(bar(fh_pct))
@@ -1597,7 +2095,13 @@ def make_widget(data, last_ok, error_msg=None, tick=0):
         if isinstance(fh_reset, str):
             reset_5h.append(fmt_time_until(fh_reset), style=CYAN)
         else:
-            reset_5h.append("—", style=CYAN)
+            reset_5h.append("\u2014", style=CYAN)
+        if pace_pct is not None:
+            if pace_pct <= 100:    pc = GREEN
+            elif pace_pct <= 150:  pc = ORANGE
+            else:                  pc = RED
+            reset_5h.append(f"  pace ", style=DIM)
+            reset_5h.append(f"{pace_pct:.0f}%", style=f"bold {pc}")
         rows.append(reset_5h)
         rows.append(Text())
 
@@ -1612,14 +2116,24 @@ def make_widget(data, last_ok, error_msg=None, tick=0):
         if isinstance(sd_reset, str):
             reset_7d.append(fmt_time_until(sd_reset), style=CYAN)
         else:
-            reset_7d.append("—", style=CYAN)
+            reset_7d.append("\u2014", style=CYAN)
         rows.append(reset_7d)
+
+        # Trend sparkline from persistent history
+        if history_samples and len(history_samples) >= 3:
+            rows.append(Text())
+            trend_row = Text()
+            trend_row.append("  \u25c8  ", style=MUTED)
+            recent_5h = [s["5h"] for s in history_samples[-20:]]
+            trend_row.append_text(sparkline(recent_5h, width=20))
+            trend_row.append(" trend", style=DIM)
+            rows.append(trend_row)
 
         total = data.get("total_tokens") or data.get("totalTokens")
         if total:
             rows.append(Text())
             tok_row = Text()
-            tok_row.append(f"  ◈  ", style=f"{MUTED}")
+            tok_row.append(f"  \u25c8  ", style=f"{MUTED}")
             tok_row.append(fmt_tokens(total), style=f"bold {WHITE}")
             tok_row.append("  tokens this period", style=MUTED)
             rows.append(tok_row)
@@ -1711,6 +2225,8 @@ def main():
                         help="Run a local JSON server for the M5StickC hardware widget")
     parser.add_argument("--port", type=int, default=8765,
                         help="Port for --serve mode (default: 8765)")
+    parser.add_argument("--tray", action="store_true",
+                        help="Run as menu bar / system tray app (requires: pip install clu-widget[tray])")
     args = parser.parse_args()
 
     REFRESH_SECS = args.refresh
@@ -1760,6 +2276,13 @@ def main():
             pass
         return
 
+    if args.tray:
+        try:
+            _tray_mode(token, REFRESH_SECS)
+        except KeyboardInterrupt:
+            pass
+        return
+
     # Ensure session key for claude.ai API (one-time interactive setup)
     if not args.session_key and not os.environ.get("CLU_SESSION_KEY"):
         _ensure_session_key()
@@ -1783,63 +2306,144 @@ def _secs_until(iso_str):
 
 
 def _serve_mode(token, port=8765, refresh_secs=90):
-    """Serve live usage JSON for the M5StickC hardware widget."""
+    """Serve live usage JSON for the menu bar app and hardware widget."""
     import threading
     import socket
     from http.server import HTTPServer, BaseHTTPRequestHandler
 
-    state = {"data": _load_cached_usage(), "error": None}
+    state = {"data": _load_cached_usage(), "error": None, "last_fetch": 0}
 
-    def _payload():
+    def _do_fetch():
+        try:
+            state["data"] = fetch_usage(token)
+            state["error"] = None
+            state["last_fetch"] = time.time()
+            _save_cached_usage(state["data"])
+            _save_history_sample(state["data"])
+        except RateLimited as e:
+            wait = e.retry_after or 30
+            state["error"] = f"rate limited ({int(wait)}s)"
+        except Exception as e:
+            state["error"] = str(e)[:60]
+
+    def _payload_full():
+        """Rich payload for the Swift menu bar app."""
+        data = state["data"]
+        if not data:
+            return {"error": state["error"] or "no data yet"}
+
+        fh = data.get("five_hour") or data.get("fiveHour") or {}
+        sd = data.get("seven_day") or data.get("sevenDay") or {}
+        fh_pct = fh.get("utilization") or 0
+        sd_pct = sd.get("utilization") or 0
+        fh_reset_iso = fh.get("resets_at")
+        sd_reset_iso = sd.get("resets_at")
+        tokens_5h = (fh.get("input_tokens") or 0) + (fh.get("output_tokens") or 0)
+
+        # Pace
+        pace_pct, elapsed_ratio = compute_pace(data)
+
+        # Promo
+        history = _load_history()
+        is_promo, promo_label = detect_promo(data, history)
+
+        # Plan
+        plan = data.get("plan") or data.get("subscription_type") or ""
+
+        # History for charts (last 6h of samples)
+        cutoff_6h = time.time() - 6 * 3600
+        recent_history = [s for s in history if s.get("ts", 0) >= cutoff_6h]
+
+        # Per-model breakdown from API response
+        models = {}
+        for key in ["seven_day_opus", "seven_day_sonnet"]:
+            val = data.get(key)
+            if val and isinstance(val, dict):
+                model_name = key.replace("seven_day_", "")
+                models[model_name] = {
+                    "utilization": val.get("utilization"),
+                    "resets_at": val.get("resets_at"),
+                }
+
+        # Extra usage credits
+        extra = data.get("extra_usage")
+        extra_info = None
+        if extra and isinstance(extra, dict):
+            extra_info = {
+                "enabled": extra.get("is_enabled", False),
+                "limit": extra.get("monthly_limit"),
+                "used": extra.get("used_credits"),
+                "utilization": extra.get("utilization"),
+            }
+
+        return {
+            "pct_5h": fh_pct,
+            "pct_7d": sd_pct,
+            "reset_5h_iso": fh_reset_iso,
+            "reset_7d_iso": sd_reset_iso,
+            "reset_5h_secs": _secs_until(fh_reset_iso),
+            "reset_7d_secs": _secs_until(sd_reset_iso),
+            "tokens_5h": tokens_5h,
+            "pace_pct": pace_pct,
+            "elapsed_ratio": round(elapsed_ratio, 4) if elapsed_ratio else None,
+            "plan": plan,
+            "is_promo": is_promo,
+            "promo_label": promo_label if is_promo else None,
+            "models": models if models else None,
+            "extra_usage": extra_info,
+            "history": recent_history,
+            "last_fetch": int(state["last_fetch"]),
+            "error": state["error"],
+        }
+
+    def _payload_simple():
+        """Lightweight payload for M5StickC hardware widget."""
         data = state["data"]
         if not data:
             return {"error": state["error"] or "no data yet"}
         fh = data.get("five_hour") or data.get("fiveHour") or {}
         sd = data.get("seven_day") or data.get("sevenDay") or {}
-        fh_pct = fh.get("utilization")
-        sd_pct = sd.get("utilization")
-        fh_reset_iso = fh.get("resets_at")
-        sd_reset_iso = sd.get("resets_at")
         tokens_5h = (fh.get("input_tokens") or 0) + (fh.get("output_tokens") or 0)
         return {
-            "pct_5h":        fh_pct,
-            "pct_7d":        sd_pct,
-            "reset_5h_secs": _secs_until(fh_reset_iso),
-            "reset_7d_secs": _secs_until(sd_reset_iso),
-            "tokens_5h":     tokens_5h,
-            "error":         state["error"],
+            "pct_5h": fh.get("utilization"),
+            "pct_7d": sd.get("utilization"),
+            "reset_5h_secs": _secs_until(fh.get("resets_at")),
+            "reset_7d_secs": _secs_until(sd.get("resets_at")),
+            "tokens_5h": tokens_5h,
+            "error": state["error"],
         }
 
     def _fetch_loop():
-        backoff = _INITIAL_BACKOFF
+        _do_fetch()  # immediate first fetch
         while True:
-            try:
-                state["data"]  = fetch_usage(token)
-                state["error"] = None
-                backoff        = _INITIAL_BACKOFF
-            except RateLimited as e:
-                wait = e.retry_after or min(backoff * 2, refresh_secs)
-                backoff = wait
-                state["error"] = f"rate limited ({int(wait)}s)"
-            except Exception as e:
-                state["error"] = str(e)[:60]
             time.sleep(refresh_secs)
+            _do_fetch()
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             if self.path == "/api":
-                body = json.dumps(_payload()).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", len(body))
-                self.end_headers()
-                self.wfile.write(body)
+                body = json.dumps(_payload_full()).encode()
+                self._respond(200, body)
+            elif self.path == "/api/simple":
+                body = json.dumps(_payload_simple()).encode()
+                self._respond(200, body)
+            elif self.path == "/api/refresh":
+                threading.Thread(target=_do_fetch, daemon=True).start()
+                self._respond(200, b'{"ok":true}')
             else:
                 self.send_response(404)
                 self.end_headers()
 
+        def _respond(self, code, body):
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Length", len(body))
+            self.end_headers()
+            self.wfile.write(body)
+
         def log_message(self, *args):
-            pass  # silence access log
+            pass
 
     threading.Thread(target=_fetch_loop, daemon=True).start()
 
@@ -1848,10 +2452,475 @@ def _serve_mode(token, port=8765, refresh_secs=90):
         local_ip = socket.gethostbyname(socket.gethostname())
     except Exception:
         local_ip = "your-mac-ip"
-    print(f"clu serve · http://{local_ip}:{port}/api")
-    print(f"Set SERVER_IP to {local_ip} in clu_hardware.ino")
+    print(f"clu serve \u00b7 http://{local_ip}:{port}/api")
+    print(f"Endpoints:")
+    print(f"  /api          full payload (menu bar app)")
+    print(f"  /api/simple   lightweight (hardware widget)")
+    print(f"  /api/refresh  trigger immediate fetch")
     print(f"Ctrl+C to stop")
     server.serve_forever()
+
+
+def _tray_mode(token, refresh_secs):
+    """Menu bar (macOS) or system tray (cross-platform) app."""
+    if sys.platform == "darwin":
+        try:
+            import objc  # noqa: F401
+            import AppKit  # noqa: F401
+            return _tray_rumps(token, refresh_secs)  # now uses PyObjC directly
+        except ImportError:
+            pass
+    try:
+        import pystray  # noqa: F401
+        from PIL import Image  # noqa: F401
+        return _tray_pystray(token, refresh_secs)
+    except ImportError:
+        pass
+    print("Tray mode requires:")
+    print("  macOS:         pip install pyobjc-framework-Cocoa")
+    print("  Linux/Windows: pip install pystray Pillow")
+    sys.exit(1)
+
+def _tray_rumps(token, refresh_secs):
+    """Native macOS menu bar app with popover dashboard using PyObjC."""
+    import warnings
+    warnings.filterwarnings("ignore", category=DeprecationWarning)
+    warnings.filterwarnings("ignore", message="PyObjCPointer")
+    import threading
+    import objc
+    from AppKit import (
+        NSApplication, NSApp, NSStatusBar, NSVariableStatusItemLength,
+        NSPopover, NSViewController, NSView, NSColor, NSFont,
+        NSTextField, NSBezierPath, NSMakeRect, NSButton, NSPoint, NSSize,
+        NSApplicationActivationPolicyAccessory, NSPopoverBehaviorTransient,
+    )
+    from Foundation import NSObject, NSTimer
+    from PyObjCTools import AppHelper
+
+    POPOVER_W, POPOVER_H = 320, 460
+
+    def hex_to_ns(hex_str):
+        h = hex_str.lstrip("#")
+        r, g, b = int(h[0:2], 16) / 255, int(h[2:4], 16) / 255, int(h[4:6], 16) / 255
+        return NSColor.colorWithCalibratedRed_green_blue_alpha_(r, g, b, 1.0)
+
+    def pct_color_hex(pct):
+        if pct >= 90: return RED
+        if pct >= 70: return ORANGE
+        if pct >= 40: return AMBER_L
+        return GREEN
+
+    # ── Shared state ──
+    state = {"data": _load_cached_usage(), "error": None, "history": _load_history()}
+    state_lock = threading.Lock()
+
+    def do_fetch():
+        try:
+            data = fetch_usage(token)
+            with state_lock:
+                state["data"] = data
+                state["error"] = None
+            _save_cached_usage(data)
+            _save_history_sample(data)
+            with state_lock:
+                state["history"] = _load_history()
+        except RateLimited:
+            with state_lock:
+                state["error"] = "rate limited"
+        except Exception as e:
+            with state_lock:
+                state["error"] = str(e)[:40]
+
+    # ── Chart view — draws line chart ──
+    class ChartView(NSView):
+        def drawRect_(self, rect):
+            w, h = rect.size.width, rect.size.height
+            pad_l, pad_r, pad_b, pad_t = 36, 8, 20, 5
+            cw, ch = w - pad_l - pad_r, h - pad_b - pad_t
+
+            # Background
+            hex_to_ns("#131320").set()
+            NSBezierPath.fillRect_(rect)
+
+            # Grid lines
+            for pct in [0, 25, 50, 75, 100]:
+                y = pad_b + (pct / 100) * ch
+                hex_to_ns("#262640").set()
+                p = NSBezierPath.bezierPath()
+                p.moveToPoint_(NSPoint(pad_l, y))
+                p.lineToPoint_(NSPoint(w - pad_r, y))
+                p.setLineWidth_(0.5)
+                p.stroke()
+                # Y-axis label
+                hex_to_ns("#555577").set()
+                s = f"{pct}%"
+                attrs = {
+                    objc.lookUpClass("NSFontAttributeName"): NSFont.monospacedSystemFontOfSize_weight_(8, 0.0),
+                    objc.lookUpClass("NSForegroundColorAttributeName"): hex_to_ns("#555577"),
+                }
+
+            with state_lock:
+                history = list(state.get("history", []))
+
+            if len(history) < 2:
+                return
+
+            now_ts = time.time()
+            cutoff = now_ts - 6 * 3600
+            recent = [s for s in history if s.get("ts", 0) >= cutoff]
+            if len(recent) < 2:
+                recent = history[-60:]
+
+            ts_min = recent[0]["ts"]
+            ts_range = max(1, now_ts - ts_min)
+
+            # Draw lines
+            for key, color_hex in [("7d", ORANGE), ("5h", CYAN)]:
+                hex_to_ns(color_hex).set()
+                p = NSBezierPath.bezierPath()
+                p.setLineWidth_(2.0)
+                for i, s in enumerate(recent):
+                    x = pad_l + ((s["ts"] - ts_min) / ts_range) * cw
+                    y = pad_b + (s.get(key, 0) / 100) * ch
+                    if i == 0:
+                        p.moveToPoint_(NSPoint(x, y))
+                    else:
+                        p.lineToPoint_(NSPoint(x, y))
+                p.stroke()
+
+    # ── Progress bar view ──
+    class BarView(NSView):
+        _pct = 0
+        _color_hex = GREEN
+
+        def set_pct_(self, pct):
+            self._pct = pct
+            self._color_hex = pct_color_hex(pct)
+            self.setNeedsDisplay_(True)
+
+        def drawRect_(self, rect):
+            w, h = rect.size.width, rect.size.height
+            # Background track
+            hex_to_ns("#374151").set()
+            track = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(rect, 4, 4)
+            track.fill()
+            # Filled portion
+            filled_w = max(0, self._pct / 100 * w)
+            if filled_w > 0:
+                hex_to_ns(self._color_hex).set()
+                fill_rect = NSMakeRect(0, 0, filled_w, h)
+                fill_path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(fill_rect, 4, 4)
+                fill_path.fill()
+
+    # ── Dashboard content view ──
+    class DashboardView(NSView):
+        def initWithFrame_(self, frame):
+            self = objc.super(DashboardView, self).initWithFrame_(frame)
+            if self is None:
+                return None
+
+            w = int(frame.size.width)
+            y = int(frame.size.height) - 15
+
+            # Title
+            y -= 24
+            self._title = self._label("Claude Usage", 15, y, 200, 22,
+                                      NSFont.boldSystemFontOfSize_(16), "#f3f4f6")
+
+            # ── 5-Hour Window ──
+            y -= 28
+            self._lbl_5h = self._label("5-Hour Window", 15, y, 180, 18,
+                                       NSFont.systemFontOfSize_(13), "#d1d5db")
+            self._pct_5h = self._label("", w - 60, y, 45, 18,
+                                       NSFont.boldSystemFontOfSize_(13), "#f3f4f6")
+            y -= 14
+            self._bar_5h = BarView.alloc().initWithFrame_(NSMakeRect(15, y, w - 30, 10))
+            self.addSubview_(self._bar_5h)
+
+            y -= 20
+            self._reset_5h = self._label("", 15, y, 280, 16,
+                                         NSFont.systemFontOfSize_(11), "#6b7280")
+
+            # ── 7-Day Window ──
+            y -= 26
+            self._lbl_7d = self._label("7-Day Window", 15, y, 180, 18,
+                                       NSFont.systemFontOfSize_(13), "#d1d5db")
+            self._pct_7d = self._label("", w - 60, y, 45, 18,
+                                       NSFont.boldSystemFontOfSize_(13), "#f3f4f6")
+            y -= 14
+            self._bar_7d = BarView.alloc().initWithFrame_(NSMakeRect(15, y, w - 30, 10))
+            self.addSubview_(self._bar_7d)
+
+            y -= 20
+            self._reset_7d = self._label("", 15, y, 280, 16,
+                                         NSFont.systemFontOfSize_(11), "#6b7280")
+
+            # ── Pace ──
+            y -= 24
+            self._pace = self._label("", 15, y, 280, 18,
+                                     NSFont.boldSystemFontOfSize_(12), CYAN)
+
+            # ── Chart ──
+            y -= 8
+            chart_h = 150
+            y -= chart_h
+            self._chart = ChartView.alloc().initWithFrame_(NSMakeRect(10, y, w - 20, chart_h))
+            self.addSubview_(self._chart)
+
+            # Legend
+            y -= 20
+            self._label("\u25cf 5h", 20, y, 30, 16, NSFont.systemFontOfSize_(11), CYAN)
+            self._label("\u25cf 7d", 60, y, 30, 16, NSFont.systemFontOfSize_(11), ORANGE)
+
+            # Footer
+            y -= 26
+            self._updated = self._label("", 15, y, 150, 14,
+                                        NSFont.systemFontOfSize_(10), "#6b7280")
+            self.btn_refresh = self._button("Refresh", w - 130, y - 2, 55, 20, "refresh:")
+            self.btn_quit = self._button("Quit", w - 55, y - 2, 40, 20, "quit:")
+
+            return self
+
+        def _label(self, text, x, y, w, h, font, color):
+            lbl = NSTextField.alloc().initWithFrame_(NSMakeRect(x, y, w, h))
+            lbl.setStringValue_(text)
+            lbl.setFont_(font)
+            lbl.setTextColor_(hex_to_ns(color))
+            lbl.setBezeled_(False)
+            lbl.setDrawsBackground_(False)
+            lbl.setEditable_(False)
+            lbl.setSelectable_(False)
+            self.addSubview_(lbl)
+            return lbl
+
+        def _button(self, title, x, y, w, h, action):
+            btn = NSButton.alloc().initWithFrame_(NSMakeRect(x, y, w, h))
+            btn.setTitle_(title)
+            btn.setBezelStyle_(14)
+            btn.setFont_(NSFont.systemFontOfSize_(10))
+            btn.setAction_(action)
+            self.addSubview_(btn)
+            return btn
+
+        def drawRect_(self, rect):
+            hex_to_ns("#111827").set()
+            NSBezierPath.fillRect_(rect)
+
+        def refresh_data(self):
+            with state_lock:
+                data = state.get("data")
+
+            if not data:
+                return
+
+            fh = data.get("five_hour") or data.get("fiveHour") or {}
+            sd = data.get("seven_day") or data.get("sevenDay") or {}
+            fh_pct = fh.get("utilization") or 0
+            sd_pct = sd.get("utilization") or 0
+
+            self._pct_5h.setStringValue_(f"{fh_pct:.0f}%")
+            self._pct_7d.setStringValue_(f"{sd_pct:.0f}%")
+            self._bar_5h.set_pct_(fh_pct)
+            self._bar_7d.set_pct_(sd_pct)
+
+            fh_reset = fh.get("resets_at")
+            sd_reset = sd.get("resets_at")
+            self._reset_5h.setStringValue_(f"Resets {fmt_time_until(fh_reset)}")
+            self._reset_7d.setStringValue_(f"Resets {fmt_time_until(sd_reset)}")
+
+            pace_pct, _ = compute_pace(data)
+            if pace_pct is not None:
+                if pace_pct <= 100:
+                    self._pace.setStringValue_(f"Pace: {pace_pct:.0f}% \u2714 under budget")
+                    self._pace.setTextColor_(hex_to_ns(GREEN))
+                elif pace_pct <= 150:
+                    self._pace.setStringValue_(f"Pace: {pace_pct:.0f}% \u25b2 ahead of budget")
+                    self._pace.setTextColor_(hex_to_ns(ORANGE))
+                else:
+                    self._pace.setStringValue_(f"Pace: {pace_pct:.0f}% \u26a0 burning fast")
+                    self._pace.setTextColor_(hex_to_ns(RED))
+
+            self._chart.setNeedsDisplay_(True)
+            self._updated.setStringValue_(f"Updated {datetime.now().strftime('%H:%M:%S')}")
+
+    # ── App delegate ──
+    class AppDelegate(NSObject):
+        statusItem = objc.ivar()
+        popover = objc.ivar()
+        dashboard = objc.ivar()
+
+        def applicationDidFinishLaunching_(self, notification):
+            self.statusItem = NSStatusBar.systemStatusBar().statusItemWithLength_(NSVariableStatusItemLength)
+            self.statusItem.button().setTitle_("clu \u00b7\u00b7\u00b7")
+            self.statusItem.button().setAction_("togglePopover:")
+            self.statusItem.button().setTarget_(self)
+
+            self.popover = NSPopover.alloc().init()
+            self.popover.setBehavior_(NSPopoverBehaviorTransient)
+
+            vc = NSViewController.alloc().init()
+            self.dashboard = DashboardView.alloc().initWithFrame_(
+                NSMakeRect(0, 0, POPOVER_W, POPOVER_H))
+            vc.setView_(self.dashboard)
+            self.popover.setContentSize_(NSSize(POPOVER_W, POPOVER_H))
+            self.popover.setContentViewController_(vc)
+
+            self.dashboard.btn_refresh.setTarget_(self)
+            self.dashboard.btn_quit.setTarget_(self)
+
+            threading.Thread(target=self._fetch_loop, daemon=True).start()
+
+            NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                5.0, self, "refreshUI:", None, True)
+            self._update_ui()
+
+        def _fetch_loop(self):
+            do_fetch()
+            while True:
+                time.sleep(refresh_secs)
+                do_fetch()
+                self.performSelectorOnMainThread_withObject_waitUntilDone_("refreshUI:", None, False)
+
+        @objc.typedSelector(b"v@:@")
+        def togglePopover_(self, sender):
+            if self.popover.isShown():
+                self.popover.close()
+            else:
+                self._update_ui()
+                self.popover.showRelativeToRect_ofView_preferredEdge_(
+                    self.statusItem.button().bounds(),
+                    self.statusItem.button(), 3)
+
+        @objc.typedSelector(b"v@:@")
+        def refreshUI_(self, timer):
+            self._update_ui()
+
+        @objc.typedSelector(b"v@:@")
+        def refresh_(self, sender):
+            threading.Thread(target=do_fetch, daemon=True).start()
+
+        @objc.typedSelector(b"v@:@")
+        def quit_(self, sender):
+            NSApp.terminate_(None)
+
+        def _update_ui(self):
+            with state_lock:
+                data = state.get("data")
+            if data:
+                fh = data.get("five_hour") or data.get("fiveHour") or {}
+                pct = fh.get("utilization") or 0
+                if pct >= 90:     dot = "\U0001f534"
+                elif pct >= 70:   dot = "\U0001f7e0"
+                elif pct >= 40:   dot = "\U0001f7e1"
+                else:             dot = "\U0001f7e2"
+                self.statusItem.button().setTitle_(f"{dot} {pct:.0f}%")
+            if self.dashboard:
+                self.dashboard.refresh_data()
+
+    app = NSApplication.sharedApplication()
+    app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+    delegate = AppDelegate.alloc().init()
+    app.setDelegate_(delegate)
+    AppHelper.runEventLoop()
+
+def _tray_pystray(token, refresh_secs):
+    """Cross-platform system tray using pystray + Pillow."""
+    import pystray
+    from PIL import Image, ImageDraw
+    import threading
+
+    state = {"data": _load_cached_usage(), "error": None, "running": True}
+    lock = threading.Lock()
+
+    def create_icon_image(pct):
+        """Generate a 64x64 icon with colored circle."""
+        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        if pct >= 90:     color = (248, 113, 113)   # RED
+        elif pct >= 70:   color = (251, 146, 60)     # ORANGE
+        elif pct >= 40:   color = (251, 191, 36)     # AMBER
+        else:             color = (52, 211, 153)      # GREEN
+        draw.ellipse([4, 4, 60, 60], fill=color)
+        # Draw text
+        try:
+            from PIL import ImageFont
+            font = ImageFont.load_default()
+            text = f"{pct:.0f}"
+            bbox = draw.textbbox((0, 0), text, font=font)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            draw.text(((64 - tw) // 2, (64 - th) // 2), text, fill=(255, 255, 255), font=font)
+        except Exception:
+            pass
+        return img
+
+    def fetch_loop():
+        backoff = _INITIAL_BACKOFF
+        while state["running"]:
+            try:
+                data = fetch_usage(token)
+                with lock:
+                    state["data"] = data
+                    state["error"] = None
+                _save_cached_usage(data)
+                _save_history_sample(data)
+                # Update icon
+                fh = data.get("five_hour") or data.get("fiveHour") or {}
+                fh_pct = fh.get("utilization") or 0
+                try:
+                    icon.icon = create_icon_image(fh_pct)
+                except Exception:
+                    pass
+            except RateLimited:
+                with lock:
+                    state["error"] = "rate limited"
+            except Exception as e:
+                with lock:
+                    state["error"] = str(e)[:40]
+            time.sleep(refresh_secs)
+
+    def make_menu():
+        with lock:
+            data = state["data"]
+        if not data:
+            return pystray.Menu(
+                pystray.MenuItem("No data yet", lambda: None),
+                pystray.MenuItem("Quit", lambda icon, item: icon.stop()),
+            )
+        fh = data.get("five_hour") or data.get("fiveHour") or {}
+        sd = data.get("seven_day") or data.get("sevenDay") or {}
+        fh_pct = fh.get("utilization") or 0
+        sd_pct = sd.get("utilization") or 0
+        plan = data.get("plan") or data.get("subscription_type") or "\u2014"
+        fh_reset = fh.get("resets_at")
+        sd_reset = sd.get("resets_at")
+        pace_pct, _ = compute_pace(data)
+        pace_str = f"{pace_pct:.0f}%" if pace_pct is not None else "\u2014"
+
+        return pystray.Menu(
+            pystray.MenuItem(f"5h: {fh_pct:.0f}%", lambda: None),
+            pystray.MenuItem(f"7d: {sd_pct:.0f}%", lambda: None),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(f"Resets in {fmt_time_until(fh_reset)}", lambda: None),
+            pystray.MenuItem(f"Pace: {pace_str}", lambda: None),
+            pystray.MenuItem(f"Plan: {plan}", lambda: None),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Quit", lambda icon, item: icon.stop()),
+        )
+
+    icon = pystray.Icon("clu", create_icon_image(0), "clu", make_menu())
+    threading.Thread(target=fetch_loop, daemon=True).start()
+
+    # Periodic menu refresh
+    def menu_updater():
+        while state["running"]:
+            time.sleep(30)
+            try:
+                icon.menu = make_menu()
+            except Exception:
+                pass
+
+    threading.Thread(target=menu_updater, daemon=True).start()
+    icon.run()
 
 
 def _initial_fetch_time(api_data):
@@ -1864,18 +2933,22 @@ def _initial_fetch_time(api_data):
     return 0
 
 def _run_loop(args, token, api_data, last_ok, error_msg, tick, data_dirs, data_dirs_info):
+    # Load persistent history for both modes
+    history_samples = _load_history()
+
     if args.dash:
         _setup_terminal(dash=True)
         console = Console(highlight=False)
 
         local_data = parse_project_data(data_dirs)
         history = UsageHistory(max_samples=60)
+        history.load_from_persistent(history_samples)
         next_fetch = _initial_fetch_time(api_data)
         backoff = _INITIAL_BACKOFF
         next_local_refresh = time.time() + 300
 
         with Live(
-            make_dashboard(api_data, local_data, last_ok, error_msg, tick, data_dirs_info, history, args.window),
+            make_dashboard(api_data, local_data, last_ok, error_msg, tick, data_dirs_info, history, args.window, history_samples),
             console=console,
             refresh_per_second=2,
             transient=False,
@@ -1890,8 +2963,9 @@ def _run_loop(args, token, api_data, last_ok, error_msg, tick, data_dirs, data_d
                         last_ok   = datetime.now().strftime("%H:%M:%S")
                         next_fetch = now_ts + REFRESH_SECS
                         backoff = _INITIAL_BACKOFF
-                        # Record sample for live chart
+                        # Record sample for live chart + persistent history
                         history.record(api_data)
+                        _save_history_sample(api_data)
                     except RateLimited as e:
                         if e.retry_after is not None:
                             wait = max(e.retry_after, 2)
@@ -1922,7 +2996,7 @@ def _run_loop(args, token, api_data, last_ok, error_msg, tick, data_dirs, data_d
                     next_local_refresh = now_ts + 300
 
                 live.update(make_dashboard(
-                    api_data, local_data, last_ok, display_error, tick, data_dirs_info, history, args.window
+                    api_data, local_data, last_ok, display_error, tick, data_dirs_info, history, args.window, history_samples
                 ))
                 tick += 1
                 time.sleep(0.5)
@@ -1941,7 +3015,7 @@ def _run_loop(args, token, api_data, last_ok, error_msg, tick, data_dirs, data_d
         next_fetch = _initial_fetch_time(api_data)
         backoff = _INITIAL_BACKOFF
 
-        with Live(make_widget(api_data, last_ok, error_msg, tick),
+        with Live(make_widget(api_data, last_ok, error_msg, tick, history_samples),
                   console=console,
                   refresh_per_second=2,
                   transient=False) as live:
@@ -1955,6 +3029,7 @@ def _run_loop(args, token, api_data, last_ok, error_msg, tick, data_dirs, data_d
                         last_ok   = datetime.now().strftime("%H:%M:%S")
                         next_fetch = now_ts + REFRESH_SECS
                         backoff = _INITIAL_BACKOFF
+                        _save_history_sample(api_data)
                     except RateLimited as e:
                         if e.retry_after is not None:
                             wait = max(e.retry_after, 2)
@@ -1980,7 +3055,7 @@ def _run_loop(args, token, api_data, last_ok, error_msg, tick, data_dirs, data_d
                     else:
                         display_error = None
 
-                live.update(make_widget(api_data, last_ok, display_error, tick))
+                live.update(make_widget(api_data, last_ok, display_error, tick, history_samples))
                 tick += 1
                 time.sleep(0.5)
 
