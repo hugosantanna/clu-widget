@@ -369,15 +369,73 @@ def get_burn_rate(daily_tokens):
 
 # ── Promo detection ──────────────────────────────────────────────────────────
 
+def _check_promo_schedule():
+    """Check if current time falls within a known 2x promo window.
+
+    Checks isclaude2x.com for active promos, with caching to avoid hammering.
+    Falls back to schedule-based detection for the March 2026 promo pattern:
+    - Weekdays: 8 AM - 2 PM ET = 2x
+    - Weekends: all day = 2x
+    """
+    # Check cached promo status (refresh every 30 minutes)
+    cache_file = Path.home() / ".claude" / ".clu_promo_cache.json"
+    try:
+        if cache_file.exists():
+            cache = json.loads(cache_file.read_text())
+            if time.time() - cache.get("ts", 0) < 1800:  # 30 min cache
+                return cache.get("active", False), cache.get("label", "")
+    except Exception:
+        pass
+
+    # Try fetching from isclaude2x.com
+    active = False
+    label = ""
+    try:
+        resp = requests.get("https://isclaude2x.com/", timeout=5)
+        if resp.status_code == 200:
+            text = resp.text.lower()
+            if "yes" in text[:500] or "2x" in text[:500] or "active" in text[:500]:
+                active = True
+                label = "2x PROMO"
+    except Exception:
+        pass
+
+    # Fallback: schedule-based detection (March 2026 promo pattern)
+    if not active:
+        try:
+            import zoneinfo
+            et = datetime.now(zoneinfo.ZoneInfo("America/New_York"))
+        except Exception:
+            et = datetime.now(timezone(timedelta(hours=-5)))
+        weekday = et.weekday()  # 0=Mon, 6=Sun
+        hour = et.hour
+        # Weekends: all day 2x
+        if weekday >= 5:
+            active = True
+            label = "2x WEEKEND"
+        # Weekdays: 8 AM - 2 PM ET
+        elif 8 <= hour < 14:
+            active = True
+            label = "2x PROMO"
+
+    # Cache result
+    try:
+        cache_file.write_text(json.dumps({"ts": int(time.time()), "active": active, "label": label}))
+        cache_file.chmod(0o600)
+    except Exception:
+        pass
+
+    return active, label
+
 def detect_promo(api_data, history_samples=None):
-    """Detect 2x usage promo from API response or heuristics.
+    """Detect 2x usage promo from API response, schedule, or heuristics.
 
     Returns (is_promo: bool, label: str).
     """
     if not api_data:
         return False, ""
 
-    # Layer 1: Check known promo fields
+    # Layer 1: Check known promo fields in API
     iguana = api_data.get("iguana_necktie")
     if iguana and isinstance(iguana, dict):
         mult = iguana.get("multiplier", iguana.get("factor", 2))
@@ -387,10 +445,15 @@ def detect_promo(api_data, history_samples=None):
     promo_keywords = {"promo", "bonus", "multiplier", "double", "boost"}
     for key, val in api_data.items():
         if any(kw in key.lower() for kw in promo_keywords):
-            if val is not None and val != False and val != 0:
+            if val is not None and val is not False and val != 0:
                 return True, "2x PROMO"
 
-    # Layer 3: Capacity heuristic from persistent history
+    # Layer 3: Schedule-based detection (isclaude2x.com + time window)
+    active, label = _check_promo_schedule()
+    if active:
+        return True, label
+
+    # Layer 4: Capacity heuristic from persistent history
     if history_samples and len(history_samples) > 100:
         recent = history_samples[-10:]
         older = history_samples[-500:-100]
@@ -2311,7 +2374,9 @@ def _serve_mode(token, port=8765, refresh_secs=90):
     import socket
     from http.server import HTTPServer, BaseHTTPRequestHandler
 
-    state = {"data": _load_cached_usage(), "error": None, "last_fetch": 0}
+    data_dirs = [Path.home() / ".claude"]
+    state = {"data": _load_cached_usage(), "error": None, "last_fetch": 0,
+             "local": None, "local_ts": 0}
 
     def _do_fetch():
         try:
@@ -2325,6 +2390,10 @@ def _serve_mode(token, port=8765, refresh_secs=90):
             state["error"] = f"rate limited ({int(wait)}s)"
         except Exception as e:
             state["error"] = str(e)[:60]
+        # Refresh local project data every 5 minutes
+        if time.time() - state["local_ts"] > 300:
+            state["local"] = parse_project_data(data_dirs)
+            state["local_ts"] = time.time()
 
     def _payload_full():
         """Rich payload for the Swift menu bar app."""
@@ -2375,6 +2444,35 @@ def _serve_mode(token, port=8765, refresh_secs=90):
                 "utilization": extra.get("utilization"),
             }
 
+        # Project data from JSONL files
+        local = state.get("local") or {}
+        cutoff_5h = datetime.now(timezone.utc) - timedelta(hours=5)
+        projects_list = []
+        for p in local.get("projects", []):
+            if p.get("last_ts") and p["last_ts"] >= cutoff_5h:
+                projects_list.append({
+                    "name": p["name"],
+                    "tokens": p["total_tokens"],
+                    "sessions": p["sessions"],
+                    "messages": p["messages"],
+                    "last_active": p["last_ts"].isoformat() if p.get("last_ts") else None,
+                    "models": p.get("models", {}),
+                })
+        sessions_list = []
+        for s in local.get("sessions", [])[:10]:
+            if s.get("last_ts") and s["last_ts"] >= cutoff_5h:
+                total_tok = s["input_tokens"] + s["output_tokens"] + s.get("cache_read", 0) + s.get("cache_create", 0)
+                sessions_list.append({
+                    "id": s["id"],
+                    "project": s["project"],
+                    "messages": s["messages"],
+                    "tokens": total_tok,
+                    "model": s.get("model", ""),
+                    "last_active": s["last_ts"].isoformat() if s.get("last_ts") else None,
+                })
+        totals = local.get("totals", {})
+        daily = local.get("daily_tokens", {})
+
         return {
             "pct_5h": fh_pct,
             "pct_7d": sd_pct,
@@ -2391,6 +2489,16 @@ def _serve_mode(token, port=8765, refresh_secs=90):
             "models": models if models else None,
             "extra_usage": extra_info,
             "history": recent_history,
+            "projects": projects_list,
+            "sessions": sessions_list,
+            "totals": {
+                "tokens": totals.get("total_tokens", 0),
+                "messages": totals.get("messages", 0),
+                "projects": totals.get("projects", 0),
+                "sessions": totals.get("sessions", 0),
+                "cache_hit_rate": round(totals.get("cache_hit_rate", 0), 1),
+            },
+            "daily_tokens": daily,
             "last_fetch": int(state["last_fetch"]),
             "error": state["error"],
         }
