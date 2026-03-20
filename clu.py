@@ -2611,17 +2611,51 @@ def _tray_mode(token, refresh_secs):
                 subprocess.Popen(["open", str(candidate)])
                 print(f"Launched {candidate.name}")
                 return
-        # No native app found — tell the user how to get it
-        print("Native menu bar app (CLUMenuBar.app) not found.")
-        print("Searched: ./clu-menubar/, ~/Applications/, /Applications/")
-        print()
-        print("To install it:")
-        print("  1. Open clu-menubar/CLUMenuBar.xcodeproj in Xcode")
-        print("  2. Build & Run (Cmd+R), or archive and export the .app")
-        print("  3. Copy CLUMenuBar.app to ~/Applications/")
-        print()
-        print("Then run:  clu --serve  (in background)  +  clu --tray")
-        sys.exit(1)
+        # Auto-download from GitHub releases
+        dest = Path.home() / "Applications" / "CLUMenuBar.app"
+        print("CLUMenuBar.app not found — downloading from GitHub…")
+        try:
+            import subprocess, tempfile, zipfile
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+                tmp_path = tmp.name
+            # Find latest release asset URL
+            api_url = "https://api.github.com/repos/hugosantanna/clu-widget/releases/latest"
+            resp = requests.get(api_url, timeout=10)
+            resp.raise_for_status()
+            assets = resp.json().get("assets", [])
+            zip_url = None
+            for asset in assets:
+                if "CLUMenuBar" in asset.get("name", "") and asset["name"].endswith(".zip"):
+                    zip_url = asset["browser_download_url"]
+                    break
+            if not zip_url:
+                print("CLUMenuBar.zip not found in latest release.")
+                print("Download manually from: https://github.com/hugosantanna/clu-widget/releases")
+                sys.exit(1)
+            # Download
+            print(f"Downloading {zip_url}…")
+            dl = requests.get(zip_url, timeout=60, stream=True)
+            dl.raise_for_status()
+            with open(tmp_path, "wb") as f:
+                for chunk in dl.iter_content(8192):
+                    f.write(chunk)
+            # Extract
+            with zipfile.ZipFile(tmp_path) as zf:
+                zf.extractall(dest.parent)
+            Path(tmp_path).unlink(missing_ok=True)
+            # Fix permissions
+            subprocess.run(["chmod", "-R", "+x", str(dest / "Contents" / "MacOS")], check=False)
+            # Clear quarantine so Gatekeeper doesn't block it
+            subprocess.run(["xattr", "-dr", "com.apple.quarantine", str(dest)], check=False)
+            print(f"Installed to {dest}")
+            subprocess.Popen(["open", str(dest)])
+            print("Launched CLUMenuBar")
+            return
+        except Exception as e:
+            print(f"Download failed: {e}")
+            print("Download manually from: https://github.com/hugosantanna/clu-widget/releases")
+            sys.exit(1)
     try:
         import pystray  # noqa: F401
         from PIL import Image  # noqa: F401
