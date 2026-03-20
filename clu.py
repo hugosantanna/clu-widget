@@ -2729,7 +2729,7 @@ def _tray_rumps(token, refresh_secs):
         _pct = 0
         _color_hex = GREEN
 
-        def set_pct_(self, pct):
+        def setPct_(self, pct):
             self._pct = pct
             self._color_hex = pct_color_hex(pct)
             self.setNeedsDisplay_(True)
@@ -2856,8 +2856,8 @@ def _tray_rumps(token, refresh_secs):
 
             self._pct_5h.setStringValue_(f"{fh_pct:.0f}%")
             self._pct_7d.setStringValue_(f"{sd_pct:.0f}%")
-            self._bar_5h.set_pct_(fh_pct)
-            self._bar_7d.set_pct_(sd_pct)
+            self._bar_5h.setPct_(fh_pct)
+            self._bar_7d.setPct_(sd_pct)
 
             fh_reset = fh.get("resets_at")
             sd_reset = sd.get("resets_at")
