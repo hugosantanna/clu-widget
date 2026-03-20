@@ -2600,10 +2600,22 @@ def _serve_mode(token, port=8765, refresh_secs=90):
 def _tray_mode(token, refresh_secs):
     """Menu bar (macOS) or system tray (cross-platform) app."""
     if sys.platform == "darwin":
+        # Prefer the native Swift menu bar app if available
+        for candidate in [
+            Path(__file__).resolve().parent / "clu-menubar" / "CLUMenuBar.app",
+            Path.home() / "Applications" / "CLUMenuBar.app",
+            Path("/Applications/CLUMenuBar.app"),
+        ]:
+            if candidate.exists():
+                import subprocess
+                subprocess.Popen(["open", str(candidate)])
+                print(f"Launched {candidate.name}")
+                return
+        # Fallback to PyObjC popover
         try:
             import objc  # noqa: F401
             import AppKit  # noqa: F401
-            return _tray_rumps(token, refresh_secs)  # now uses PyObjC directly
+            return _tray_rumps(token, refresh_secs)
         except ImportError:
             pass
     try:
