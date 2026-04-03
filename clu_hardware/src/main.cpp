@@ -529,7 +529,7 @@ void fetch_data() {
   }
 
   HTTPClient http;
-  String url = String("http://") + SERVER_IP + ":" + String(SERVER_PORT) + "/api";
+  String url = String("http://") + SERVER_IP + ":" + String(SERVER_PORT) + "/api/simple";
   http.begin(url);
   http.setTimeout(8000);
   int code = http.GET();
@@ -680,13 +680,15 @@ void loop() {
   // ── Tilt-to-sleep: face down (z acceleration negative = screen facing down) ──
   bool face_down = (imu_az < -0.7f);
 
+  static int wake_count = 0;
   if (face_down && !is_asleep) {
     is_asleep = true;
+    wake_count = 0;
     M5.Lcd.setBrightness(0);
+  } else if (face_down && is_asleep) {
+    wake_count = 0;  // reset so non-consecutive readings don't accumulate
   } else if (!face_down && is_asleep) {
-    is_asleep = true;  // will clear on next tick with stable reading
-    // Debounce: require 2 consecutive non-face-down readings
-    static int wake_count = 0;
+    // Debounce: require 4 consecutive non-face-down readings
     wake_count++;
     if (wake_count > 3) {
       is_asleep = false;

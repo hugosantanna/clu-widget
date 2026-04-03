@@ -69,6 +69,7 @@ struct APIResponse: Codable {
     let reset_7d_secs: Int?
     let tokens_5h: Int?
     let pace_pct: Double?
+    let pace_7d_pct: Double?
     let elapsed_ratio: Double?
     let plan: String?
     let is_promo: Bool?
@@ -110,10 +111,14 @@ class UsageService {
         guard let url = URL(string: "\(baseURL)/api") else { return }
         isLoading = true
         URLSession.shared.dataTask(with: url) { [weak self] responseData, _, error in
+            guard let responseData = responseData, error == nil else {
+                DispatchQueue.main.async { self?.isLoading = false }
+                return
+            }
+            let decoded = try? JSONDecoder().decode(APIResponse.self, from: responseData)
             DispatchQueue.main.async {
                 self?.isLoading = false
-                guard let responseData = responseData, error == nil else { return }
-                if let response = try? JSONDecoder().decode(APIResponse.self, from: responseData) {
+                if let response = decoded {
                     self?.data = response
                     self?.lastUpdate = Date()
                 }
@@ -254,9 +259,14 @@ struct WindowChartView: View {
 
     private var usagePoints: [(date: Date, pct: Double)] {
         // Only show samples from the current window — filter out previous cycles
-        history
+        let filtered = history
             .filter { $0.date >= windowStart && $0.date <= windowEnd }
             .map { ($0.date, $0[keyPath: keyPath]) }
+        // Downsample to ~300 points max so Charts stays responsive
+        let maxPoints = 300
+        guard filtered.count > maxPoints else { return filtered }
+        let stride = Double(filtered.count) / Double(maxPoints)
+        return (0..<maxPoints).map { i in filtered[Int(Double(i) * stride)] }
     }
 
     /// Human-readable time format for x-axis depending on window size
@@ -451,35 +461,22 @@ struct PopoverView: View {
                 if let data = service.data {
                     // Promo badge is already in the header — no need for a separate banner
 
-                    // Usage bars
+                    // Usage bars with inline pace
                     UsageBar(label: "5-Hour Window", pct: data.pct_5h ?? 0, resetSecs: data.reset_5h_secs)
                         .padding(.horizontal, 16)
-                        .padding(.bottom, 14)
+                    if let pace = data.pace_pct {
+                        PaceRow(pace: pace)
+                            .padding(.horizontal, 16)
+                    }
+                    Spacer().frame(height: 10)
 
                     UsageBar(label: "7-Day Window", pct: data.pct_7d ?? 0, resetSecs: data.reset_7d_secs)
                         .padding(.horizontal, 16)
-                        .padding(.bottom, 14)
-
-                    // Pace
-                    if let pace = data.pace_pct {
-                        let paceColor = pace <= 100 ? Color.cluGreen : pace <= 150 ? Color.cluOrange : Color.cluRed
-                        let paceIcon = pace <= 100 ? "checkmark.circle.fill" : pace <= 150 ? "exclamationmark.triangle.fill" : "flame.fill"
-                        let paceLabel = pace <= 100 ? "under budget" : pace <= 150 ? "ahead of budget" : "burning fast"
-
-                        HStack(spacing: 6) {
-                            Image(systemName: paceIcon)
-                                .font(.system(size: 12))
-                                .foregroundStyle(paceColor)
-                            Text("Pace \(Int(pace))%")
-                                .font(.system(size: 13, weight: .semibold, design: .rounded))
-                                .foregroundStyle(paceColor)
-                            Text(paceLabel)
-                                .font(.system(size: 11))
-                                .foregroundStyle(.secondary)
-                        }
-                        .padding(.horizontal, 16)
-                        .padding(.bottom, 12)
+                    if let pace7d = data.pace_7d_pct {
+                        PaceRow(pace: pace7d)
+                            .padding(.horizontal, 16)
                     }
+                    Spacer().frame(height: 10)
 
                     // Charts
                     if let history = data.history, history.count >= 2 {
@@ -616,19 +613,13 @@ struct DashboardWindowView: View {
                             }
 
                             UsageBar(label: "5-Hour Window", pct: data.pct_5h ?? 0, resetSecs: data.reset_5h_secs)
-                            UsageBar(label: "7-Day Window", pct: data.pct_7d ?? 0, resetSecs: data.reset_7d_secs)
-
                             if let pace = data.pace_pct {
-                                let pc = pace <= 100 ? Color.cluGreen : pace <= 150 ? Color.cluOrange : Color.cluRed
-                                let icon = pace <= 100 ? "checkmark.circle.fill" : pace <= 150 ? "exclamationmark.triangle.fill" : "flame.fill"
-                                HStack(spacing: 6) {
-                                    Image(systemName: icon).font(.system(size: 12)).foregroundStyle(pc)
-                                    Text("Pace \(Int(pace))%")
-                                        .font(.system(size: 13, weight: .semibold, design: .rounded))
-                                        .foregroundStyle(pc)
-                                    Text(pace <= 100 ? "under budget" : pace <= 150 ? "ahead" : "burning fast")
-                                        .font(.system(size: 11)).foregroundStyle(.secondary)
-                                }
+                                PaceRow(pace: pace)
+                            }
+
+                            UsageBar(label: "7-Day Window", pct: data.pct_7d ?? 0, resetSecs: data.reset_7d_secs)
+                            if let pace7d = data.pace_7d_pct {
+                                PaceRow(pace: pace7d)
                             }
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -773,6 +764,22 @@ struct DashboardWindowView: View {
             .padding(20)
         }
         .frame(minWidth: 500, idealWidth: 560, minHeight: 500, idealHeight: 700)
+    }
+}
+
+struct PaceRow: View {
+    let pace: Double
+    private var color: Color { pace <= 100 ? .cluGreen : pace <= 150 ? .cluOrange : .cluRed }
+    private var icon: String { pace <= 100 ? "checkmark.circle.fill" : pace <= 150 ? "exclamationmark.triangle.fill" : "flame.fill" }
+    private var label: String { pace <= 100 ? "under budget" : pace <= 150 ? "ahead of budget" : "burning fast" }
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon).font(.system(size: 11)).foregroundStyle(color)
+            Text("Pace \(Int(pace))%")
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .foregroundStyle(color)
+            Text(label).font(.system(size: 10)).foregroundStyle(.secondary)
+        }
     }
 }
 

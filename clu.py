@@ -646,6 +646,31 @@ def compute_pace(api_data):
     except Exception:
         return None, None
 
+def compute_pace_7d(api_data):
+    """Compute 7-day pace % = (actual_pct / expected_pct_at_this_time) × 100."""
+    if not api_data:
+        return None, None
+    sd = api_data.get("seven_day") or api_data.get("sevenDay") or {}
+    actual_pct = sd.get("utilization") or 0
+    reset_iso = sd.get("resets_at")
+    if not reset_iso or not isinstance(reset_iso, str):
+        return None, None
+    try:
+        target = datetime.fromisoformat(reset_iso)
+        if target.tzinfo is None:
+            target = target.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        secs_left = max(0, (target - now).total_seconds())
+        window_secs = 7 * 86400
+        elapsed_ratio = 1.0 - (secs_left / window_secs)
+        elapsed_ratio = min(max(elapsed_ratio, 0.01), 1.0)
+        expected_pct = elapsed_ratio * 100
+        pace = (actual_pct / expected_pct) * 100 if expected_pct > 0 else 0
+        return round(pace, 1), elapsed_ratio
+    except Exception:
+        return None, None
+
+
 def _downsample(values, n):
     """Reduce a list to n points by averaging adjacent groups."""
     if len(values) <= n:
@@ -2405,7 +2430,8 @@ def _serve_mode(token, port=8765, refresh_secs=90):
 
     data_dirs = [Path.home() / ".claude"]
     state = {"data": _load_cached_usage(), "error": None, "last_fetch": 0,
-             "local": None, "local_ts": 0}
+             "local": None, "local_ts": 0,
+             "promo": (False, "")}
 
     def _do_fetch():
         try:
@@ -2414,6 +2440,12 @@ def _serve_mode(token, port=8765, refresh_secs=90):
             state["last_fetch"] = time.time()
             _save_cached_usage(state["data"])
             _save_history_sample(state["data"])
+            # Precompute promo status so /api never blocks on external HTTP
+            try:
+                history = _load_history()
+                state["promo"] = detect_promo(state["data"], history)
+            except Exception:
+                pass
         except RateLimited as e:
             wait = e.retry_after or 30
             state["error"] = f"rate limited ({int(wait)}s)"
@@ -2440,10 +2472,11 @@ def _serve_mode(token, port=8765, refresh_secs=90):
 
         # Pace
         pace_pct, elapsed_ratio = compute_pace(data)
+        pace_7d_pct, _ = compute_pace_7d(data)
 
-        # Promo
+        # Promo (precomputed in fetch loop to avoid blocking on external HTTP)
         history = _load_history()
-        is_promo, promo_label = detect_promo(data, history)
+        is_promo, promo_label = state["promo"]
 
         # Plan
         plan = data.get("plan") or data.get("subscription_type") or ""
@@ -2511,6 +2544,7 @@ def _serve_mode(token, port=8765, refresh_secs=90):
             "reset_7d_secs": _secs_until(sd_reset_iso),
             "tokens_5h": tokens_5h,
             "pace_pct": pace_pct,
+            "pace_7d_pct": pace_7d_pct,
             "elapsed_ratio": round(elapsed_ratio, 4) if elapsed_ratio else None,
             "plan": plan,
             "is_promo": is_promo,
